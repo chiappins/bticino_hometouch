@@ -165,9 +165,20 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class HometouchOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options for BTicino HOMETOUCH."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: config_entries.ConfigEntry | None = None) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
+        if config_entry is not None:
+            self._config_entry_compat = config_entry
+
+    @property
+    def _entry(self) -> config_entries.ConfigEntry:
+        """Return config entry compatible with all Home Assistant versions."""
+        try:
+            if hasattr(self, "config_entry") and self.config_entry is not None:
+                return self.config_entry
+        except Exception:
+            pass
+        return getattr(self, "_config_entry_compat", None)
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -176,8 +187,13 @@ class HometouchOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        data = self.config_entry.data
-        options = self.config_entry.options
+        entry = self._entry
+        data = entry.data if entry else {}
+        options = entry.options if entry else {}
+
+        current_stream = options.get(CONF_STREAM_URL) or data.get(CONF_STREAM_URL) or ""
+        current_gate = options.get(CONF_GATE_ADDR) or data.get(CONF_GATE_ADDR) or DEFAULT_GATE_ADDR
+        current_door = options.get(CONF_DOOR_ADDR) or data.get(CONF_DOOR_ADDR) or DEFAULT_DOOR_ADDR
 
         return self.async_show_form(
             step_id="init",
@@ -185,15 +201,15 @@ class HometouchOptionsFlowHandler(config_entries.OptionsFlow):
                 {
                     vol.Optional(
                         CONF_STREAM_URL,
-                        default=options.get(CONF_STREAM_URL, data.get(CONF_STREAM_URL, "")),
+                        default=str(current_stream),
                     ): str,
                     vol.Optional(
                         CONF_GATE_ADDR,
-                        default=options.get(CONF_GATE_ADDR, data.get(CONF_GATE_ADDR, DEFAULT_GATE_ADDR)),
+                        default=str(current_gate),
                     ): str,
                     vol.Optional(
                         CONF_DOOR_ADDR,
-                        default=options.get(CONF_DOOR_ADDR, data.get(CONF_DOOR_ADDR, DEFAULT_DOOR_ADDR)),
+                        default=str(current_door),
                     ): str,
                 }
             ),
