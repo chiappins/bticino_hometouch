@@ -25,6 +25,7 @@ from .const import (
     CONF_SIP_ACCOUNT,
     CONF_SIP_PASSWORD,
     CONF_SIP_SERVER,
+    CONF_STREAM_URL,
     CONF_USERNAME,
     DEFAULT_DOOR_ADDR,
     DEFAULT_GATE_ADDR,
@@ -55,6 +56,7 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             password = user_input[CONF_PASSWORD].strip()
             door_addr = user_input.get(CONF_DOOR_ADDR, DEFAULT_DOOR_ADDR).strip()
             gate_addr = user_input.get(CONF_GATE_ADDR, DEFAULT_GATE_ADDR).strip()
+            stream_url = user_input.get(CONF_STREAM_URL, "").strip()
 
             await self.async_set_unique_id(f"bticino_hometouch_{host}")
             self._abort_if_unique_id_configured()
@@ -123,6 +125,7 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_KEY_PATH: key_file,
                         CONF_GATE_ADDR: gate_addr,
                         CONF_DOOR_ADDR: door_addr,
+                        CONF_STREAM_URL: stream_url,
                     },
                 )
             except Exception as err:
@@ -135,9 +138,10 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         data_schema = vol.Schema(
             {
-                vol.Required(CONF_HOST, default="192.168.1.103"): str,
+                vol.Required(CONF_HOST): str,
                 vol.Required(CONF_USERNAME): str,
                 vol.Required(CONF_PASSWORD): str,
+                vol.Optional(CONF_STREAM_URL): str,
                 vol.Optional(CONF_GATE_ADDR, default=DEFAULT_GATE_ADDR): str,
                 vol.Optional(CONF_DOOR_ADDR, default=DEFAULT_DOOR_ADDR): str,
             }
@@ -179,6 +183,10 @@ class HometouchOptionsFlowHandler(config_entries.OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(
                 {
+                    vol.Optional(
+                        CONF_STREAM_URL,
+                        default=options.get(CONF_STREAM_URL, data.get(CONF_STREAM_URL, "")),
+                    ): str,
                     vol.Optional(
                         CONF_GATE_ADDR,
                         default=options.get(CONF_GATE_ADDR, data.get(CONF_GATE_ADDR, DEFAULT_GATE_ADDR)),

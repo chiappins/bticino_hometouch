@@ -50,4 +50,4 @@ OWN_CALL_PATTERN = "*8*40*"
 OWN_CALL_END_PATTERN = "*8*41*"
 
 # Platforms supported
-PLATFORMS = ["lock", "button", "binary_sensor"]
+PLATFORMS = ["lock", "button", "binary_sensor", "camera"]

@@ -63,9 +63,15 @@ class HometouchCamera(Camera):
         # Default fallback stream: SIP/RTSP stream from Hometouch or go2rtc
         return f"rtsp://{self._client.host}:554/live"
 
+    async def async_create_stream(self):
+        """Create stream and wake up camera via SIP session."""
+        self.hass.async_create_task(self._client.async_trigger_camera())
+        return await super().async_create_stream()
+
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return a still image from the camera."""
         # When integration is paired with go2rtc or stream component, Home Assistant handles frames
         return None
+

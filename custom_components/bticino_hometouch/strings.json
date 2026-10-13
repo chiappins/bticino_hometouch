@@ -9,7 +9,8 @@
           "username": "Email account BTicino / Legrand Eliot",
           "password": "Password account BTicino / Legrand Eliot",
           "gate_addr": "Indirizzo Cancello Primario (default: 20)",
-          "door_addr": "Indirizzo Portoncino Secondario (default: 21)"
+          "door_addr": "Indirizzo Portoncino Secondario (default: 21)",
+          "stream_url": "URL Streaming Video (opzionale, es. stream SIP o go2rtc)"
         }
       }
     },
@@ -25,8 +26,9 @@
   "options": {
     "step": {
       "init": {
-        "title": "Opzioni Indirizzi BTicino HOMETOUCH",
+        "title": "Opzioni BTicino HOMETOUCH",
         "data": {
+          "stream_url": "URL Streaming Video (opzionale, es. stream SIP o go2rtc)",
           "gate_addr": "Indirizzo Cancello Primario",
           "door_addr": "Indirizzo Portoncino Secondario"
         }
@@ -34,6 +36,11 @@
     }
   },
   "entity": {
+    "camera": {
+      "intercom_camera": {
+        "name": "Videocitofono"
+      }
+    },
     "lock": {
       "gate_lock": {
         "name": "Cancello"
