@@ -69,18 +69,25 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if not plants:
                     raise RuntimeError("Nessun impianto BTicino / Eliot associato a questo account")
 
-                plant_id = str(plants[0].get("id") or plants[0].get("PlantId") or plants[0].get("plantId"))
-                gw_info = await eliot_client.async_get_gateway_info(plant_id)
-                gw_id = None
+                plant_list = plants if isinstance(plants, list) else plants.get("plants", [plants] if isinstance(plants, dict) else [])
+                first_plant = plant_list[0] if plant_list else {}
+                plant_id = str(first_plant.get("PlantId") or first_plant.get("plantPortalId") or first_plant.get("id"))
+                gw_id = str(first_plant.get("GatewayId") or first_plant.get("gatewayPortalId") or "")
                 psw_open = ""
 
-                gw_list = gw_info if isinstance(gw_info, list) else [gw_info]
-                for item in gw_list:
+                gw_info = await eliot_client.async_get_gateway_info(plant_id, gw_id or None)
+                gw_items = gw_info if isinstance(gw_info, list) else [gw_info]
+                for item in gw_items:
                     if isinstance(item, dict):
                         if item.get("PswOpen"):
                             psw_open = str(item["PswOpen"])
                         if item.get("GatewayId"):
                             gw_id = str(item["GatewayId"])
+                        elif item.get("GatewayPortalId"):
+                            gw_id = str(item["GatewayPortalId"])
+
+                if not gw_id:
+                    raise RuntimeError(f"Impossibile trovare il GatewayId per l'impianto {plant_id}")
 
                 sip_info = await eliot_client.async_get_sip_credentials(plant_id, gw_id)
                 sip_account = ""

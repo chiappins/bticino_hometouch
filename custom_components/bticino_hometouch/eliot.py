@@ -9,8 +9,8 @@ import logging
 import os
 import ssl
 import subprocess
-import urllib.request
 import urllib.error
+import urllib.request
 import zipfile
 from typing import Any
 
@@ -42,7 +42,7 @@ class EliotCloudClient:
     def _sync_request(self, path: str, method: str = "GET", data: dict | None = None) -> Any:
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, application/zip, */*",
             "prj_name": PRJ_NAME,
         }
         if self.auth_token:
@@ -62,7 +62,7 @@ class EliotCloudClient:
                     new_token = resp.headers.get("auth_token") or resp.headers.get("Auth_Token")
                     if new_token:
                         self.auth_token = new_token
-                    
+
                     raw_bytes = resp.read()
                     if raw_bytes.startswith(b"\x1f\x8b"):
                         import gzip
@@ -72,6 +72,11 @@ class EliotCloudClient:
                             pass
 
                     self.base_url = srv
+
+                    # If response is a zip archive or binary, return raw bytes
+                    if raw_bytes.startswith(b"PK"):
+                        return raw_bytes
+
                     try:
                         res_body = raw_bytes.decode("utf-8")
                         if res_body:
@@ -82,6 +87,7 @@ class EliotCloudClient:
                         return {}
                     except UnicodeDecodeError:
                         return raw_bytes
+
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="replace")
                 _LOGGER.error("HTTP %s from %s: %s", e.code, url, err_body)
@@ -120,19 +126,28 @@ class EliotCloudClient:
             return res.get("plants", [res])
         return []
 
-    async def async_get_gateway_info(self, plant_id: str, gateway_id: str | None = None) -> dict[str, Any]:
+    async def async_get_gateway_info(self, plant_id: str, gateway_id: str | None = None) -> Any:
         """Async get gateway details including PswOpen."""
         path = f"/eliot/plants/{plant_id}/gateway/{gateway_id}" if gateway_id else f"/eliot/plants/{plant_id}/gateway"
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, self._sync_request, path, "GET", None)
-        return res if isinstance(res, dict) else {}
+        return await loop.run_in_executor(None, self._sync_request, path, "GET", None)
 
-    async def async_get_sip_credentials(self, plant_id: str, gateway_id: str | None = None) -> dict[str, Any]:
-        """Async get SIP credentials."""
-        path = f"/eliot/sip/users/plants/{plant_id}/gateway/{gateway_id}" if gateway_id else f"/eliot/sip/users/plants/{plant_id}"
+    async def async_get_sip_credentials(self, plant_id: str, gateway_id: str | None = None) -> Any:
+        """Async get SIP credentials from /eliot/sip/users/plants/{plant_id}/gateway/{gateway_id}."""
+        if not gateway_id:
+            gw_info = await self.async_get_gateway_info(plant_id)
+            gw_items = gw_info if isinstance(gw_info, list) else [gw_info]
+            for item in gw_items:
+                if isinstance(item, dict) and item.get("GatewayId"):
+                    gateway_id = str(item["GatewayId"])
+                    break
+
+        if not gateway_id:
+            raise RuntimeError(f"Impossibile determinare GatewayId per l'impianto {plant_id}")
+
+        path = f"/eliot/sip/users/plants/{plant_id}/gateway/{gateway_id}"
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, self._sync_request, path, "GET", None)
-        return res if isinstance(res, dict) else {}
+        return await loop.run_in_executor(None, self._sync_request, path, "GET", None)
 
     def _sync_enroll_cert(self, sip_account: str, storage_dir: str) -> tuple[str, str, str]:
         """Generate key/CSR and obtain signed client certificate from Eliot."""
@@ -142,25 +157,54 @@ class EliotCloudClient:
         ca_file = os.path.join(storage_dir, "ca.crt")
         csr_file = os.path.join(storage_dir, "client.csr")
 
-        # Check if already present
-        if os.path.exists(key_file) and os.path.exists(cert_file):
+        # Check if already present and valid
+        if os.path.exists(key_file) and os.path.exists(cert_file) and os.path.getsize(cert_file) > 100:
             _LOGGER.info("Using existing SIP client certificate at %s", cert_file)
             return cert_file, key_file, ca_file
 
         _LOGGER.info("Generating new RSA 2048-bit key and CSR for %s...", sip_account)
         subj = f"/C=IT/ST=Italy/L=Varese/O=Bticino spa/OU=DSI-PQS/CN={sip_account}"
-        subprocess.run(["openssl", "genrsa", "-out", key_file, "2048"], check=True, capture_output=True)
-        subprocess.run(["openssl", "req", "-new", "-key", key_file, "-out", csr_file, "-subj", subj], check=True, capture_output=True)
 
-        with open(csr_file, "r") as f:
-            csr_pem = f.read()
+        # Try pure python cryptography first if available, otherwise openssl CLI
+        try:
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            with open(key_file, "wb") as kf:
+                kf.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+
+            csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "IT"),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Italy"),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, "Varese"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Bticino spa"),
+                x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "DSI-PQS"),
+                x509.NameAttribute(NameOID.COMMON_NAME, sip_account),
+            ])).sign(key, hashes.SHA256())
+
+            csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+            with open(csr_file, "w") as cf:
+                cf.write(csr_pem)
+
+        except ImportError:
+            subprocess.run(["openssl", "genrsa", "-out", key_file, "2048"], check=True, capture_output=True)
+            subprocess.run(["openssl", "req", "-new", "-key", key_file, "-out", csr_file, "-subj", subj], check=True, capture_output=True)
+            with open(csr_file, "r") as f:
+                csr_pem = f.read()
 
         payload = {
             "CommonName": sip_account,
             "CSR": csr_pem,
         }
 
-        _LOGGER.info("Requesting signed certificate from Eliot cloud...")
+        _LOGGER.info("Requesting signed certificate from Eliot cloud (/eliot/users/cert/signcert)...")
         res = self._sync_request("/eliot/users/cert/signcert", method="POST", data=payload)
 
         # Handle zip or raw response
@@ -175,7 +219,6 @@ class EliotCloudClient:
                             with open(cert_file, "wb") as out_cert:
                                 out_cert.write(zf.read(name))
             except zipfile.BadZipFile:
-                # Raw cert DER or PEM
                 with open(cert_file, "wb") as out_cert:
                     out_cert.write(res)
         elif isinstance(res, dict):
@@ -184,8 +227,11 @@ class EliotCloudClient:
                     with open(cert_file, "w") as out_cert:
                         out_cert.write(str(v))
                     break
+        elif isinstance(res, str) and "-----BEGIN CERTIFICATE" in res:
+            with open(cert_file, "w") as out_cert:
+                out_cert.write(res)
 
-        if not os.path.exists(cert_file):
+        if not os.path.exists(cert_file) or os.path.getsize(cert_file) == 0:
             raise RuntimeError("Impossibile salvare il certificato client firmato da Eliot")
 
         _LOGGER.info("Successfully enrolled SIP client certificate at %s", cert_file)

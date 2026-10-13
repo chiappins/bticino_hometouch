@@ -147,9 +147,15 @@ class HometouchClient:
         self.host = host
         self.port = port
         self.password = password
-        self.sip_user = sip_user
+        if sip_user and "@" in sip_user:
+            user_part, domain_part = sip_user.split("@", 1)
+            self.sip_user = user_part
+            self.sip_domain = sip_domain or domain_part
+        else:
+            self.sip_user = sip_user
+            self.sip_domain = sip_domain
+
         self.sip_pass = sip_pass
-        self.sip_domain = sip_domain
         self.sip_server = sip_server
         self.sip_port = sip_port
         self.cert_file = cert_file
