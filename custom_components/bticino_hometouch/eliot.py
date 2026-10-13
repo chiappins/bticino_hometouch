@@ -17,10 +17,10 @@ from typing import Any
 _LOGGER = logging.getLogger(__name__)
 
 ELIOT_SERVERS = [
-    "https://stable-eliot-mule-balancer-2146709889.eu-west-1.elb.amazonaws.com:8080",
-    "https://stable-eliot-mule-balancer-2146709889.eu-west-1.elb.amazonaws.com",
-    "https://www.myhomeweb.com:8080",
     "https://www.myhomeweb.com",
+    "https://www.myhomeweb.com:8080",
+    "https://stable-eliot-mule-balancer-2146709889.eu-west-1.elb.amazonaws.com",
+    "https://stable-eliot-mule-balancer-2146709889.eu-west-1.elb.amazonaws.com:8080",
 ]
 
 PRJ_NAME = "MHT"

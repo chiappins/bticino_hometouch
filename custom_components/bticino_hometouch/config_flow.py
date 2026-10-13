@@ -127,7 +127,11 @@ class HometouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             except Exception as err:
                 _LOGGER.error("Errore durante configurazione BTicino HOMETOUCH: %s", err)
-                errors["base"] = "cannot_connect"
+                err_str = str(err)
+                if "401" in err_str or "403" in err_str or "432" in err_str or "Credenziali" in err_str:
+                    errors["base"] = "invalid_auth"
+                else:
+                    errors["base"] = "cannot_connect"
 
         data_schema = vol.Schema(
             {
