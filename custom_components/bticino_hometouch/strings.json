@@ -51,6 +51,9 @@
       },
       "stair_light": {
         "name": "Luce Scale"
+      },
+      "trigger_camera": {
+        "name": "Accendi Telecamera (SIP)"
       }
     },
     "binary_sensor": {

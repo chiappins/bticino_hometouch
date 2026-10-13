@@ -360,6 +360,189 @@ class HometouchClient:
         f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
         return await self.send_sip_command(f)
 
+    async def async_trigger_camera(self, duration: int = 15) -> bool:
+        """Trigger outdoor camera streaming via SIP INVITE session."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sync_trigger_camera, duration)
+
+    def _sync_trigger_camera(self, duration: int = 15) -> bool:
+        """Connect to SIP TLS, perform REGISTER and send INVITE with SRTP to wake up camera."""
+        if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
+            _LOGGER.error("Certificato o chiave SIP mancante per autoaccensione camera (%s, %s)", self.cert_file, self.key_file)
+            return False
+
+        target_uri = f"sip:MHT@{self.sip_domain}"
+        call_id = str(uuid.uuid4())
+        cseq = 1
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            ssl_sock = ctx.wrap_socket(s, server_hostname=self.sip_server)
+            ssl_sock.connect((self.sip_server, self.sip_port))
+
+            # 1. REGISTER
+            branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+            tag = uuid.uuid4().hex[:8]
+            reg_msg = (
+                f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq} REGISTER\r\n"
+                f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                f"Expires: 300\r\n"
+                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                f"Content-Length: 0\r\n\r\n"
+            )
+            ssl_sock.sendall(reg_msg.encode())
+            resp = ssl_sock.recv(4096).decode(errors="replace")
+            if "401" in resp or "407" in resp:
+                chal = _parse_digest_challenge(resp)
+                auth_hdr = _compute_digest(
+                    "REGISTER",
+                    f"sip:{self.sip_domain}",
+                    chal.get("realm", self.sip_domain),
+                    chal.get("nonce", ""),
+                    self.sip_user or "",
+                    self.sip_pass or "",
+                    qop=chal.get("qop"),
+                    opaque=chal.get("opaque"),
+                )
+                cseq += 1
+                branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+                reg_auth = (
+                    f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                    f"Max-Forwards: 70\r\n"
+                    f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                    f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq} REGISTER\r\n"
+                    f"Authorization: {auth_hdr}\r\n"
+                    f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                    f"Expires: 300\r\n"
+                    f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                    f"Content-Length: 0\r\n\r\n"
+                )
+                ssl_sock.sendall(reg_auth.encode())
+                ssl_sock.recv(4096)
+
+            # 2. INVITE with SRTP SDP to wake up camera
+            cseq += 1
+            branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+            tag = uuid.uuid4().hex[:8]
+            crypto_key = "W190ZXN0X2tleV9mb3Jfc3J0cF9saW5waG9uZTF="
+            sdp_body = (
+                "v=0\r\n"
+                f"o={self.sip_user} 123456 654321 IN IP4 192.168.1.100\r\n"
+                "s=Talk\r\n"
+                "c=IN IP4 192.168.1.100\r\n"
+                "t=0 0\r\n"
+                "m=audio 7078 RTP/SAVP 8 0 96\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=rtpmap:0 PCMU/8000\r\n"
+                "a=rtpmap:96 opus/48000/2\r\n"
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
+                "a=sendrecv\r\n"
+                "m=video 9078 RTP/SAVP 97\r\n"
+                "a=rtpmap:97 H264/90000\r\n"
+                "a=fmtp:97 profile-level-id=42801F\r\n"
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
+                "a=recvonly\r\n"
+                "a=DEVADDR:0\r\n"
+                "a=CAMERASLIDING:1\r\n"
+            )
+            sdp_bytes = sdp_body.encode("utf-8")
+            invite_msg = (
+                f"INVITE {target_uri} SIP/2.0\r\n"
+                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                f"To: <{target_uri}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq} INVITE\r\n"
+                f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                f"Content-Type: application/sdp\r\n"
+                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                f"Content-Length: {len(sdp_bytes)}\r\n\r\n"
+                f"{sdp_body}"
+            )
+            ssl_sock.sendall(invite_msg.encode())
+
+            ssl_sock.settimeout(4.0)
+            last_branch = branch
+            start_t = time.time()
+            camera_woken = False
+
+            while time.time() - start_t < (duration + 5):
+                try:
+                    data = ssl_sock.recv(4096).decode(errors="replace")
+                    if not data:
+                        break
+                    if "407 Proxy Authentication Required" in data or "401 Unauthorized" in data:
+                        chal = _parse_digest_challenge(data)
+                        auth_hdr = _compute_digest(
+                            "INVITE",
+                            target_uri,
+                            chal.get("realm", self.sip_domain),
+                            chal.get("nonce", ""),
+                            self.sip_user or "",
+                            self.sip_pass or "",
+                            qop=chal.get("qop"),
+                            opaque=chal.get("opaque"),
+                        )
+                        cseq += 1
+                        last_branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+                        invite_auth = (
+                            f"INVITE {target_uri} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
+                            f"Max-Forwards: 70\r\n"
+                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                            f"To: <{target_uri}>\r\n"
+                            f"Call-ID: {call_id}\r\n"
+                            f"CSeq: {cseq} INVITE\r\n"
+                            f"Proxy-Authorization: {auth_hdr}\r\n"
+                            f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                            f"Content-Type: application/sdp\r\n"
+                            f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                            f"Content-Length: {len(sdp_bytes)}\r\n\r\n"
+                            f"{sdp_body}"
+                        )
+                        ssl_sock.sendall(invite_auth.encode())
+                    elif "180 Ringing" in data or "200 OK" in data:
+                        _LOGGER.info("Telecamera svegliata con successo via SIP INVITE! (180 Ringing)")
+                        camera_woken = True
+                        time.sleep(duration)
+                        cancel_msg = (
+                            f"CANCEL {target_uri} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
+                            f"Max-Forwards: 70\r\n"
+                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                            f"To: <{target_uri}>\r\n"
+                            f"Call-ID: {call_id}\r\n"
+                            f"CSeq: {cseq} CANCEL\r\n"
+                            f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                            f"Content-Length: 0\r\n\r\n"
+                        )
+                        ssl_sock.sendall(cancel_msg.encode())
+                        break
+                except socket.timeout:
+                    break
+
+            ssl_sock.close()
+            return camera_woken
+        except Exception as err:
+            _LOGGER.error("Errore durante attivazione sessione SIP camera: %s", err)
+            return False
+
     async def start_monitoring(self) -> None:
         """Start background task to monitor doorbell events on local LAN."""
         if self._running:

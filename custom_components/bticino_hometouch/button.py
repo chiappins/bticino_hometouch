@@ -29,6 +29,7 @@ async def async_setup_entry(
             HometouchGateButton(client, entry),
             HometouchDoorButton(client, entry),
             HometouchStairLightButton(client, entry),
+            HometouchCameraButton(client, entry),
         ],
         True,
     )
@@ -104,3 +105,22 @@ class HometouchStairLightButton(HometouchBaseButton):
         """Handle the button press."""
         _LOGGER.info("Triggering staircase light via Hometouch")
         await self._client.trigger_staircase_light()
+
+
+class HometouchCameraButton(HometouchBaseButton):
+    """Button to wake up outdoor camera via SIP session."""
+
+    _attr_translation_key = "trigger_camera"
+    _attr_name = "Accendi Telecamera (SIP)"
+    _attr_icon = "mdi:camera-wireless"
+
+    def __init__(self, client: HometouchClient, entry: ConfigEntry) -> None:
+        """Initialize the camera trigger button."""
+        super().__init__(client, entry)
+        self._attr_unique_id = f"{entry.entry_id}_trigger_camera"
+
+    async def async_press(self) -> None:
+        """Handle the button press."""
+        _LOGGER.info("Waking up outdoor camera via SIP session")
+        await self._client.async_trigger_camera()
+
