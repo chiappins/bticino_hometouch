@@ -562,36 +562,56 @@ class HometouchClient:
 
     async def _authenticate_session(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, resp_str: str) -> bool:
         """Perform HMAC-SHA256 authentication on OpenWebNet port 20000."""
+        _LOGGER.info("Handshake sessione monitor: ricevuto '%s'", resp_str)
         if resp_str == OWN_ACK:
+            _LOGGER.info("Sessione monitor aperta senza autenticazione necessaria (ACK diretto).")
             return True
 
-        if "*98*2##" in resp_str and self.password:
+        if "*98*2##" in resp_str:
+            if not self.password:
+                _LOGGER.error("Il citofono richiede autenticazione HMAC-SHA256 (*98*2##) ma nessuna password è configurata!")
+                return False
+
+            _LOGGER.info("Citofono richiede autenticazione HMAC-SHA256 (*98*2##). Invio ACK...")
             writer.write(OWN_ACK.encode())
             await writer.drain()
 
             ra_resp = await reader.read(256)
             ra_str = ra_resp.decode("latin1", errors="replace")
+            _LOGGER.info("Ricevuto nonce RA dal citofono: %s", ra_str)
+
             if ra_str.startswith("*#") and ra_str.endswith("##"):
                 ra_wire = ra_str[2:-2]
                 rb_wire, hmac_wire = _calc_hmac_sha256_response(ra_wire, self.password)
                 client_resp = f"*#{rb_wire}*{hmac_wire}##"
+                _LOGGER.info("Invio risposta HMAC calcolata al citofono...")
                 writer.write(client_resp.encode())
                 await writer.drain()
 
                 auth_result = await reader.read(256)
                 res_str = auth_result.decode("latin1", errors="replace")
+                _LOGGER.info("Esito autenticazione dal citofono: %s", res_str)
                 if res_str.startswith("*#") and res_str.endswith("##") and res_str != OWN_NACK:
                     writer.write(OWN_ACK.encode())
                     await writer.drain()
+                    _LOGGER.info("✅ Autenticazione monitor OpenWebNet RIUSCITA!")
                     return True
+                else:
+                    _LOGGER.error("❌ Autenticazione monitor FALLITA (ricevuto %s). Verificare la password OpenWebNet!", res_str)
+        else:
+            _LOGGER.warning("Risposta inattesa alla richiesta monitor: %s", resp_str)
         return False
 
     async def _monitor_loop(self) -> None:
         """Maintain persistent connection to monitor bus events on port 20000."""
         while self._running:
             try:
+                _LOGGER.info("Connessione in corso a %s:%s per ascolto eventi bus citofono...", self.host, self.port)
                 reader, writer = await asyncio.open_connection(self.host, self.port)
-                await reader.read(100)
+                init_ack = await reader.read(100)
+                init_ack_str = init_ack.decode("latin1", errors="replace")
+                _LOGGER.info("Connesso al citofono (ACK iniziale: %s). Richiesta sessione monitor (*99*1##)...", init_ack_str)
+
                 writer.write(OWN_MONITOR_SESSION.encode())
                 await writer.drain()
                 resp = await reader.read(100)
@@ -599,16 +619,18 @@ class HometouchClient:
 
                 auth_ok = await self._authenticate_session(reader, writer, resp_str)
                 if not auth_ok:
+                    _LOGGER.warning("Autenticazione sessione monitor non riuscita. Nuovo tentativo tra 15s...")
                     writer.close()
                     await writer.wait_closed()
                     await asyncio.sleep(15)
                     continue
 
-                _LOGGER.info("Connected to Hometouch monitor session on %s:%s", self.host, self.port)
+                _LOGGER.info("🎉 Connesso alla sessione monitor! IN ASCOLTO DI TUTTI I FRAME DEL BUS CITOFONO...")
                 buffer = ""
                 while self._running:
                     chunk = await reader.read(256)
                     if not chunk:
+                        _LOGGER.warning("Connessione monitor chiusa dal citofono.")
                         break
                     buffer += chunk.decode("latin1", errors="replace")
                     while "##" in buffer:
@@ -622,16 +644,48 @@ class HometouchClient:
             except asyncio.CancelledError:
                 break
             except Exception as err:
-                _LOGGER.warning("Lost connection to Hometouch monitor session (%s). Reconnecting in 10s...", err)
+                _LOGGER.warning("Connessione monitor persa (%s). Riconnessione tra 10s...", err)
                 await asyncio.sleep(10)
 
     def _process_monitor_frame(self, frame: str) -> None:
         """Process incoming OpenWebNet frame from monitor session."""
-        if OWN_CALL_PATTERN in frame:
-            _LOGGER.info("🔔 Doorbell call detected! Frame: %s", frame)
+        _LOGGER.info("📩 [BUS CITOFONO FRAME]: %s", frame)
+
+        is_call_start = False
+        is_call_end = False
+
+        if (
+            OWN_CALL_PATTERN in frame
+            or "*8*1#" in frame
+            or "*8*20#" in frame
+            or "*8*19#" in frame
+            or "*8*91##" in frame
+            or "*8*1*" in frame
+            or "*8*2*" in frame
+            or "*7*1#" in frame
+        ):
+            is_call_start = True
+        elif OWN_CALL_END_PATTERN in frame or "*8*92##" in frame or "*8*0#" in frame or "*8*0*" in frame:
+            is_call_end = True
+        elif frame.startswith("*8*") and frame.endswith("##"):
+            # Qualsiasi frame videocitofonico WHO=8
+            _LOGGER.info("Frame videocitofonia generico WHO=8 rilevato: %s", frame)
+            is_call_start = True
+
+        if is_call_start:
+            _LOGGER.info("🔔🔔🔔 CAMPANELLO ATTIVO! Rilevata chiamata citofonica (frame: %s) 🔔🔔🔔", frame)
             self._is_call_active = True
             self._notify_event("doorbell", True)
-        elif OWN_CALL_END_PATTERN in frame:
-            _LOGGER.info("Doorbell call ended. Frame: %s", frame)
+            asyncio.create_task(self._auto_reset_doorbell(25))
+        elif is_call_end:
+            _LOGGER.info("🔕 Chiamata citofono terminata (frame: %s)", frame)
+            self._is_call_active = False
+            self._notify_event("doorbell", False)
+
+    async def _auto_reset_doorbell(self, timeout: int = 25) -> None:
+        """Auto reset doorbell state after timeout if no end frame is received."""
+        await asyncio.sleep(timeout)
+        if self._is_call_active:
+            _LOGGER.info("Auto-reset stato campanello dopo %ds di timeout", timeout)
             self._is_call_active = False
             self._notify_event("doorbell", False)
