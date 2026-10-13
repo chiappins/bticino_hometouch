@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configura BTicino HOMETOUCH",
+        "description": "Inserisci l'indirizzo IP locale del videocitofono HOMETOUCH e le tue credenziali dell'app BTicino Door Entry / Legrand Eliot. L'integrazione recupererà automaticamente la chiave di sicurezza e scaricherà il certificato crittografico mTLS firmato dal Cloud.",
+        "data": {
+          "host": "Indirizzo IP del citofono HOMETOUCH",
+          "username": "Email account BTicino / Legrand Eliot",
+          "password": "Password account BTicino / Legrand Eliot",
+          "gate_addr": "Indirizzo Cancello Primario (default: 20)",
+          "door_addr": "Indirizzo Portoncino Secondario (default: 21)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Impossibile autenticarsi su Legrand Eliot o contattare il citofono. Verifica credenziali e connessione.",
+      "invalid_auth": "Credenziali Legrand Eliot non corrette.",
+      "unknown": "Errore imprevisto durante la configurazione."
+    },
+    "abort": {
+      "already_configured": "Questo dispositivo HOMETOUCH è già configurato in Home Assistant."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni Indirizzi BTicino HOMETOUCH",
+        "data": {
+          "gate_addr": "Indirizzo Cancello Primario",
+          "door_addr": "Indirizzo Portoncino Secondario"
+        }
+      }
+    }
+  },
+  "entity": {
+    "lock": {
+      "gate_lock": {
+        "name": "Cancello"
+      },
+      "door_lock": {
+        "name": "Portoncino"
+      }
+    },
+    "button": {
+      "open_gate": {
+        "name": "Apri Cancello"
+      },
+      "open_door": {
+        "name": "Apri Portoncino"
+      },
+      "stair_light": {
+        "name": "Luce Scale"
+      }
+    },
+    "binary_sensor": {
+      "doorbell": {
+        "name": "Campanello"
+      }
+    }
+  }
+}

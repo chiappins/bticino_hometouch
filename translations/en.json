@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect BTicino HOMETOUCH",
+        "description": "Enter the IP address of your BTicino HOMETOUCH intercom panel and configure parameters.",
+        "data": {
+          "host": "HOMETOUCH Intercom IP Address",
+          "port": "OpenWebNet Port (default 20000)",
+          "password": "OpenWebNet Password (leave blank if not configured)",
+          "door_addr": "Door Lock Entrance Panel Address (default 4)",
+          "gate_addr": "Gate Relay / Entrance Panel Address (default 4)",
+          "gate_cid": "Gate Command Type (2009 = Aux Relay, 10060 = Secondary Lock)",
+          "stream_url": "Custom RTSP/WebRTC Video Stream URL (optional)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the specified IP address.",
+      "invalid_auth": "Invalid OpenWebNet password.",
+      "unknown": "Unexpected error occurred during configuration."
+    },
+    "abort": {
+      "already_configured": "This HOMETOUCH device is already configured in Home Assistant."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "BTicino HOMETOUCH Options",
+        "data": {
+          "door_addr": "Door Lock Entrance Panel Address",
+          "gate_addr": "Gate Relay / Entrance Panel Address",
+          "gate_cid": "Gate Command Type (2009 = Aux Relay, 10060 = Secondary Lock)",
+          "stream_url": "Custom RTSP/WebRTC Video Stream URL"
+        }
+      }
+    }
+  },
+  "entity": {
+    "lock": {
+      "door_lock": {
+        "name": "Main Door Lock"
+      }
+    },
+    "button": {
+      "open_gate": {
+        "name": "Open Gate"
+      },
+      "open_door": {
+        "name": "Open Main Door"
+      },
+      "stair_light": {
+        "name": "Staircase Light"
+      }
+    },
+    "binary_sensor": {
+      "doorbell": {
+        "name": "Doorbell Call"
+      }
+    },
+    "camera": {
+      "intercom_camera": {
+        "name": "Video Intercom"
+      }
+    }
+  }
+}

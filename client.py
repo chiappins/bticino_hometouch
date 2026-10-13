@@ -1,0 +1,448 @@
+"""Async OpenWebNet and SIP client for BTicino HOMETOUCH."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import os
+import random
+import secrets
+import socket
+import ssl
+import time
+import uuid
+from typing import Callable
+
+from .const import (
+    DEFAULT_DOOR_ADDR,
+    DEFAULT_GATE_ADDR,
+    DEFAULT_PORT,
+    DEFAULT_SIP_PORT,
+    DEFAULT_SIP_SERVER,
+    FRAME_DOOR_LOCK_OFF,
+    FRAME_DOOR_LOCK_ON,
+    FRAME_GATE_OFF,
+    FRAME_GATE_ON,
+    FRAME_STAIR_LIGHT,
+    OWN_ACK,
+    OWN_CALL_END_PATTERN,
+    OWN_CALL_PATTERN,
+    OWN_CMD_SESSION,
+    OWN_MONITOR_SESSION,
+    OWN_NACK,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _decode_wire_hex(s: str) -> str:
+    """Decode OpenWebNet 4-chars-per-byte format to lowercase hex string."""
+    hex_str = ""
+    for i in range(0, len(s), 4):
+        chunk = s[i : i + 4]
+        if len(chunk) == 4:
+            try:
+                high = int(chunk[0:2])
+                low = int(chunk[2:4])
+                val = (high << 4) | low
+                hex_str += f"{val:02x}"
+            except ValueError:
+                pass
+    return hex_str
+
+
+def _encode_wire_hex(hex_str: str) -> str:
+    """Encode lowercase hex string to OpenWebNet 4-chars-per-byte format."""
+    wire = ""
+    try:
+        raw_bytes = bytes.fromhex(hex_str)
+        for b in raw_bytes:
+            high = b >> 4
+            low = b & 0x0F
+            wire += f"{high:02d}{low:02d}"
+    except Exception:
+        pass
+    return wire
+
+
+def _calc_hmac_sha256_response(ra_wire: str, password: str) -> tuple[str, str]:
+    """Calculate HMAC-SHA256 authentication response according to Legrand OpenWebNet specification.
+    Returns (rb_wire, hmac_wire).
+    """
+    ra_hex = _decode_wire_hex(ra_wire)
+    rb_bytes = secrets.token_bytes(32)
+    rb_hex = rb_bytes.hex()
+    rb_wire = _encode_wire_hex(rb_hex)
+
+    kab_hex = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    A = "736F70653E"  # Client identity (ASCII 'sopen>')
+    B = "636F70653E"  # Server identity (ASCII 'copen>')
+
+    data_to_hash = (ra_hex + rb_hex + A + B + kab_hex).encode("ascii")
+    hmac_digest = hashlib.sha256(data_to_hash).hexdigest()
+    hmac_wire = _encode_wire_hex(hmac_digest)
+
+    return rb_wire, hmac_wire
+
+
+def _parse_digest_challenge(response_text: str) -> dict[str, str]:
+    """Parse HTTP/SIP Digest challenge header."""
+    for line in response_text.split("\r\n"):
+        lower = line.lower()
+        if lower.startswith("proxy-authenticate:") or lower.startswith("www-authenticate:"):
+            auth_val = line.split(":", 1)[1].strip()
+            parts = {}
+            for item in auth_val.replace("Digest ", "").split(","):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    parts[k.strip()] = v.strip().strip('"')
+            return parts
+    return {}
+
+
+def _compute_digest(method: str, uri: str, realm: str, nonce: str, username: str, password: str, qop: str | None = None, opaque: str | None = None) -> str:
+    """Compute RFC 2617 Digest response with qop=auth support."""
+    ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    if qop and "auth" in qop:
+        nc = "00000001"
+        cnonce = uuid.uuid4().hex[:8]
+        resp = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
+        auth_hdr = (
+            f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri}", response="{resp}", algorithm=MD5, '
+            f'cnonce="{cnonce}", nc={nc}, qop=auth'
+        )
+    else:
+        resp = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        auth_hdr = (
+            f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri}", response="{resp}", algorithm=MD5'
+        )
+    if opaque:
+        auth_hdr += f', opaque="{opaque}"'
+    return auth_hdr
+
+
+class HometouchClient:
+    """Client for communicating with BTicino HOMETOUCH via LAN and SIP TLS."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int = DEFAULT_PORT,
+        password: str | None = None,
+        sip_user: str | None = None,
+        sip_pass: str | None = None,
+        sip_domain: str | None = None,
+        sip_server: str = DEFAULT_SIP_SERVER,
+        sip_port: int = DEFAULT_SIP_PORT,
+        cert_file: str | None = None,
+        key_file: str | None = None,
+        gate_addr: str = DEFAULT_GATE_ADDR,
+        door_addr: str = DEFAULT_DOOR_ADDR,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.password = password
+        self.sip_user = sip_user
+        self.sip_pass = sip_pass
+        self.sip_domain = sip_domain
+        self.sip_server = sip_server
+        self.sip_port = sip_port
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self.gate_addr = gate_addr
+        self.door_addr = door_addr
+
+        self._listeners: list[Callable[[str, bool], None]] = []
+        self._is_call_active = False
+        self._running = False
+        self._monitor_task: asyncio.Task | None = None
+
+    @property
+    def is_call_active(self) -> bool:
+        """Return True if doorbell call is active."""
+        return self._is_call_active
+
+    def register_listener(self, cb: Callable[[str, bool], None]) -> Callable[[], None]:
+        """Register callback for event updates."""
+        self._listeners.append(cb)
+        def unsubscribe():
+            if cb in self._listeners:
+                self._listeners.remove(cb)
+        return unsubscribe
+
+    def _notify_event(self, event_type: str, state: bool) -> None:
+        """Notify registered listeners of an event."""
+        for cb in self._listeners:
+            try:
+                cb(event_type, state)
+            except Exception as err:
+                _LOGGER.error("Error in listener callback: %s", err)
+
+    def _sync_send_sip_command(self, body: str) -> bool:
+        """Send command encapsulated in SIP MESSAGE over mTLS (Blocking)."""
+        if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
+            _LOGGER.error("Certificato o chiave SIP mancante (%s, %s)", self.cert_file, self.key_file)
+            return False
+
+        target_uri = f"sip:MHT@{self.sip_domain}"
+        call_id = str(uuid.uuid4())
+        cseq = 1
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            ssl_sock = ctx.wrap_socket(s, server_hostname=self.sip_server)
+            ssl_sock.connect((self.sip_server, self.sip_port))
+
+            # 1. Send SIP REGISTER
+            branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+            tag = uuid.uuid4().hex[:8]
+            reg_msg = (
+                f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq} REGISTER\r\n"
+                f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                f"Expires: 300\r\n"
+                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                f"Content-Length: 0\r\n\r\n"
+            )
+            ssl_sock.sendall(reg_msg.encode())
+            resp = ssl_sock.recv(4096).decode(errors="replace")
+
+            if "401" in resp or "407" in resp:
+                chal = _parse_digest_challenge(resp)
+                auth_hdr = _compute_digest("REGISTER", f"sip:{self.sip_domain}", chal.get("realm", self.sip_domain), chal.get("nonce", ""), self.sip_user or "", self.sip_pass or "", qop=chal.get("qop"), opaque=chal.get("opaque"))
+                cseq += 1
+                branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+                reg_auth = (
+                    f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                    f"Max-Forwards: 70\r\n"
+                    f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                    f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq} REGISTER\r\n"
+                    f"Authorization: {auth_hdr}\r\n"
+                    f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                    f"Expires: 300\r\n"
+                    f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                    f"Content-Length: 0\r\n\r\n"
+                )
+                ssl_sock.sendall(reg_auth.encode())
+                ssl_sock.recv(4096)
+
+            # 2. Send Initial MESSAGE
+            cseq += 1
+            branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+            tag = uuid.uuid4().hex[:8]
+            body_bytes = body.encode("utf-8")
+            msg = (
+                f"MESSAGE {target_uri} SIP/2.0\r\n"
+                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                f"To: <{target_uri}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq} MESSAGE\r\n"
+                f"Content-Type: text/plain\r\n"
+                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                f"Content-Length: {len(body_bytes)}\r\n\r\n"
+                f"{body}"
+            )
+            ssl_sock.sendall(msg.encode())
+
+            # Read response
+            ssl_sock.settimeout(4.0)
+            chal = {}
+            while True:
+                try:
+                    m_resp = ssl_sock.recv(4096).decode(errors="replace")
+                    if not m_resp:
+                        break
+                    if "407 Proxy Authentication Required" in m_resp or "401 Unauthorized" in m_resp:
+                        chal = _parse_digest_challenge(m_resp)
+                        break
+                    elif "200 Ok" in m_resp or "200 OK" in m_resp:
+                        ssl_sock.close()
+                        return True
+                except socket.timeout:
+                    break
+
+            if chal:
+                realm = chal.get("realm", self.sip_domain)
+                nonce = chal.get("nonce", "")
+                qop = chal.get("qop")
+                opaque = chal.get("opaque")
+                auth_hdr = _compute_digest("MESSAGE", target_uri, realm, nonce, self.sip_user or "", self.sip_pass or "", qop=qop, opaque=opaque)
+
+                cseq += 1
+                branch = "z9hG4bK" + uuid.uuid4().hex[:12]
+                auth_msg = (
+                    f"MESSAGE {target_uri} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                    f"Max-Forwards: 70\r\n"
+                    f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                    f"To: <{target_uri}>\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq} MESSAGE\r\n"
+                    f"Proxy-Authorization: {auth_hdr}\r\n"
+                    f"Content-Type: text/plain\r\n"
+                    f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                    f"Content-Length: {len(body_bytes)}\r\n\r\n"
+                    f"{body}"
+                )
+                ssl_sock.sendall(auth_msg.encode())
+
+                start_wait = time.time()
+                while time.time() - start_wait < 5.0:
+                    try:
+                        final_resp = ssl_sock.recv(4096).decode(errors="replace")
+                        if "200 Ok" in final_resp or "200 OK" in final_resp:
+                            ssl_sock.close()
+                            return True
+                    except socket.timeout:
+                        break
+
+            ssl_sock.close()
+            return True
+        except Exception as err:
+            _LOGGER.error("Errore invio SIP comando %s: %s", body, err)
+            return False
+
+    async def send_sip_command(self, body: str) -> bool:
+        """Async wrapper for sending a SIP command."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sync_send_sip_command, body)
+
+    async def open_gate(self) -> bool:
+        """Open the primary gate (Cancello Primario, WHERE=20)."""
+        _LOGGER.info("Opening Primary Gate (addr: %s)", self.gate_addr)
+        f_on = FRAME_DOOR_LOCK_ON.format(addr=self.gate_addr)
+        f_off = FRAME_DOOR_LOCK_OFF.format(addr=self.gate_addr)
+        r1 = await self.send_sip_command(f_on)
+        await asyncio.sleep(0.3)
+        r2 = await self.send_sip_command(f_off)
+        return r1 and r2
+
+    async def open_door(self) -> bool:
+        """Open the secondary pedestrian door (Portoncino Secondario, WHERE=21)."""
+        _LOGGER.info("Opening Secondary Portoncino (addr: %s)", self.door_addr)
+        f_on = FRAME_DOOR_LOCK_ON.format(addr=self.door_addr)
+        f_off = FRAME_DOOR_LOCK_OFF.format(addr=self.door_addr)
+        r1 = await self.send_sip_command(f_on)
+        await asyncio.sleep(0.3)
+        r2 = await self.send_sip_command(f_off)
+        return r1 and r2
+
+    async def trigger_staircase_light(self) -> bool:
+        """Trigger staircase / auxiliary light."""
+        _LOGGER.info("Triggering staircase light")
+        f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
+        return await self.send_sip_command(f)
+
+    async def start_monitoring(self) -> None:
+        """Start background task to monitor doorbell events on local LAN."""
+        if self._running:
+            return
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def stop_monitoring(self) -> None:
+        """Stop background monitor task."""
+        self._running = False
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _authenticate_session(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, resp_str: str) -> bool:
+        """Perform HMAC-SHA256 authentication on OpenWebNet port 20000."""
+        if resp_str == OWN_ACK:
+            return True
+
+        if "*98*2##" in resp_str and self.password:
+            writer.write(OWN_ACK.encode())
+            await writer.drain()
+
+            ra_resp = await reader.read(256)
+            ra_str = ra_resp.decode("latin1", errors="replace")
+            if ra_str.startswith("*#") and ra_str.endswith("##"):
+                ra_wire = ra_str[2:-2]
+                rb_wire, hmac_wire = _calc_hmac_sha256_response(ra_wire, self.password)
+                client_resp = f"*#{rb_wire}*{hmac_wire}##"
+                writer.write(client_resp.encode())
+                await writer.drain()
+
+                auth_result = await reader.read(256)
+                res_str = auth_result.decode("latin1", errors="replace")
+                if res_str.startswith("*#") and res_str.endswith("##") and res_str != OWN_NACK:
+                    writer.write(OWN_ACK.encode())
+                    await writer.drain()
+                    return True
+        return False
+
+    async def _monitor_loop(self) -> None:
+        """Maintain persistent connection to monitor bus events on port 20000."""
+        while self._running:
+            try:
+                reader, writer = await asyncio.open_connection(self.host, self.port)
+                await reader.read(100)
+                writer.write(OWN_MONITOR_SESSION.encode())
+                await writer.drain()
+                resp = await reader.read(100)
+                resp_str = resp.decode("latin1", errors="replace")
+
+                auth_ok = await self._authenticate_session(reader, writer, resp_str)
+                if not auth_ok:
+                    writer.close()
+                    await writer.wait_closed()
+                    await asyncio.sleep(15)
+                    continue
+
+                _LOGGER.info("Connected to Hometouch monitor session on %s:%s", self.host, self.port)
+                buffer = ""
+                while self._running:
+                    chunk = await reader.read(256)
+                    if not chunk:
+                        break
+                    buffer += chunk.decode("latin1", errors="replace")
+                    while "##" in buffer:
+                        idx = buffer.find("##") + 2
+                        frame = buffer[:idx]
+                        buffer = buffer[idx:]
+                        self._process_monitor_frame(frame)
+
+                writer.close()
+                await writer.wait_closed()
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                _LOGGER.warning("Lost connection to Hometouch monitor session (%s). Reconnecting in 10s...", err)
+                await asyncio.sleep(10)
+
+    def _process_monitor_frame(self, frame: str) -> None:
+        """Process incoming OpenWebNet frame from monitor session."""
+        if OWN_CALL_PATTERN in frame:
+            _LOGGER.info("🔔 Doorbell call detected! Frame: %s", frame)
+            self._is_call_active = True
+            self._notify_event("doorbell", True)
+        elif OWN_CALL_END_PATTERN in frame:
+            _LOGGER.info("Doorbell call ended. Frame: %s", frame)
+            self._is_call_active = False
+            self._notify_event("doorbell", False)
