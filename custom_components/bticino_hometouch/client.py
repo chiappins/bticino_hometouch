@@ -167,6 +167,7 @@ class HometouchClient:
         self._is_call_active = False
         self._running = False
         self._monitor_task: asyncio.Task | None = None
+        self._sip_listener_task: asyncio.Task | None = None
 
     @property
     def is_call_active(self) -> bool:
@@ -544,19 +545,26 @@ class HometouchClient:
             return False
 
     async def start_monitoring(self) -> None:
-        """Start background task to monitor doorbell events on local LAN."""
+        """Start background tasks to monitor doorbell events."""
         if self._running:
             return
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._sip_listener_task = asyncio.create_task(self._sip_listener_loop())
 
     async def stop_monitoring(self) -> None:
-        """Stop background monitor task."""
+        """Stop background monitor tasks."""
         self._running = False
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        if self._sip_listener_task and not self._sip_listener_task.done():
+            self._sip_listener_task.cancel()
+            try:
+                await self._sip_listener_task
             except asyncio.CancelledError:
                 pass
 
@@ -689,3 +697,218 @@ class HometouchClient:
             _LOGGER.info("Auto-reset stato campanello dopo %ds di timeout", timeout)
             self._is_call_active = False
             self._notify_event("doorbell", False)
+
+    async def _sip_listener_loop(self) -> None:
+        """Maintain persistent SIP TLS connection to receive incoming calls (doorbell rings)."""
+        if not self.sip_server or not self.sip_user or not self.cert_file or not self.key_file:
+            _LOGGER.debug("SIP listener non avviato: credenziali o certificati SIP mancanti.")
+            return
+
+        _LOGGER.warning("🚀 Avvio monitor chiamate SIP BTicino su %s:%d (account: %s)", self.sip_server, self.sip_port, self.sip_user)
+
+        while self._running:
+            writer: asyncio.StreamWriter | None = None
+            try:
+                _LOGGER.info("Connessione SIP TLS a %s:%d...", self.sip_server, self.sip_port)
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+
+                reader, writer = await asyncio.open_connection(self.sip_server, self.sip_port, ssl=ctx)
+
+                call_id = f"ha-sip-{secrets.token_hex(8)}"
+                from_tag = f"tag-{secrets.token_hex(4)}"
+                cseq = 1
+
+                reg_msg = (
+                    f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
+                    f"Max-Forwards: 70\r\n"
+                    f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
+                    f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq} REGISTER\r\n"
+                    f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
+                    f"Expires: 300\r\n"
+                    f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
+                    f"Content-Length: 0\r\n\r\n"
+                )
+                writer.write(reg_msg.encode())
+                await writer.drain()
+
+                resp = (await reader.read(2048)).decode("latin1", errors="replace")
+                if "401 Unauthorized" in resp and self.sip_pass:
+                    chal = _parse_digest_challenge(resp)
+                    realm = chal.get("realm", self.sip_domain or "")
+                    nonce = chal.get("nonce", "")
+                    cseq += 1
+                    auth_digest = _compute_digest(
+                        "REGISTER",
+                        f"sip:{self.sip_domain}",
+                        realm,
+                        nonce,
+                        self.sip_user,
+                        self.sip_pass,
+                        qop=chal.get("qop"),
+                        opaque=chal.get("opaque"),
+                    )
+                    auth_reg = (
+                        f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                        f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
+                        f"Max-Forwards: 70\r\n"
+                        f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
+                        f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: {cseq} REGISTER\r\n"
+                        f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
+                        f"Authorization: {auth_digest}\r\n"
+                        f"Expires: 300\r\n"
+                        f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
+                        f"Content-Length: 0\r\n\r\n"
+                    )
+                    writer.write(auth_reg.encode())
+                    await writer.drain()
+                    resp = (await reader.read(2048)).decode("latin1", errors="replace")
+
+                if "200 " in resp or "200 OK" in resp or "successful" in resp.lower():
+                    _LOGGER.warning("🎉 Connessione SIP stabilita con successo! In ascolto delle chiamate dal campanello...")
+                else:
+                    _LOGGER.warning("Registrazione SIP non riuscita: %s", resp[:150])
+                    writer.close()
+                    await writer.wait_closed()
+                    await asyncio.sleep(20)
+                    continue
+
+                last_keepalive = time.time()
+                buffer = ""
+
+                while self._running:
+                    now = time.time()
+                    if now - last_keepalive > 120:
+                        cseq += 1
+                        re_reg = (
+                            f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
+                            f"Max-Forwards: 70\r\n"
+                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
+                            f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
+                            f"Call-ID: {call_id}\r\n"
+                            f"CSeq: {cseq} REGISTER\r\n"
+                            f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
+                            f"Expires: 300\r\n"
+                            f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
+                            f"Content-Length: 0\r\n\r\n"
+                        )
+                        writer.write(re_reg.encode())
+                        await writer.drain()
+                        last_keepalive = now
+
+                    try:
+                        chunk = await asyncio.wait_for(reader.read(2048), timeout=30.0)
+                        if not chunk:
+                            _LOGGER.warning("Connessione SIP chiusa dal server remoto.")
+                            break
+                        buffer += chunk.decode("latin1", errors="replace")
+                        self._process_sip_incoming(buffer, writer)
+                        buffer = ""
+                    except asyncio.TimeoutError:
+                        continue
+
+                if writer:
+                    writer.close()
+                    await writer.wait_closed()
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                _LOGGER.warning("Errore connessione SIP listener (%s). Riconnessione tra 15s...", err)
+                if writer:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                await asyncio.sleep(15)
+
+    def _process_sip_incoming(self, data: str, writer: asyncio.StreamWriter) -> None:
+        """Process incoming SIP messages from server."""
+        _LOGGER.debug("Ricevuto messaggio SIP: %s", data[:200])
+
+        if "INVITE " in data:
+            _LOGGER.warning("🔔🔔🔔 CAMPANELLO ATTIVO! Rilevata chiamata citofonica in arrivo! 🔔🔔🔔")
+            self._is_call_active = True
+            self._notify_event("doorbell", True)
+
+            via = ""
+            from_hdr = ""
+            to_hdr = ""
+            call_id = ""
+            cseq = ""
+            for line in data.splitlines():
+                ll = line.lower()
+                if ll.startswith("via:"):
+                    via = line[4:].strip()
+                elif ll.startswith("from:"):
+                    from_hdr = line[5:].strip()
+                elif ll.startswith("to:"):
+                    to_hdr = line[3:].strip()
+                elif ll.startswith("call-id:"):
+                    call_id = line[8:].strip()
+                elif ll.startswith("cseq:"):
+                    cseq = line[5:].strip()
+
+            if via and from_hdr and to_hdr and call_id and cseq:
+                ringing_resp = (
+                    f"SIP/2.0 180 Ringing\r\n"
+                    f"Via: {via}\r\n"
+                    f"From: {from_hdr}\r\n"
+                    f"To: {to_hdr};tag=ha-{secrets.token_hex(4)}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq}\r\n"
+                    f"Content-Length: 0\r\n\r\n"
+                )
+                try:
+                    writer.write(ringing_resp.encode())
+                    asyncio.create_task(writer.drain())
+                except Exception as err:
+                    _LOGGER.warning("Errore invio 180 Ringing: %s", err)
+
+            asyncio.create_task(self._auto_reset_doorbell(30))
+
+        elif "CANCEL " in data or "BYE " in data:
+            _LOGGER.warning("🔕 Chiamata citofonica terminata.")
+            self._is_call_active = False
+            self._notify_event("doorbell", False)
+            via = ""
+            from_hdr = ""
+            to_hdr = ""
+            call_id = ""
+            cseq = ""
+            for line in data.splitlines():
+                ll = line.lower()
+                if ll.startswith("via:"):
+                    via = line[4:].strip()
+                elif ll.startswith("from:"):
+                    from_hdr = line[5:].strip()
+                elif ll.startswith("to:"):
+                    to_hdr = line[3:].strip()
+                elif ll.startswith("call-id:"):
+                    call_id = line[8:].strip()
+                elif ll.startswith("cseq:"):
+                    cseq = line[5:].strip()
+            if via and call_id and cseq:
+                ok_resp = (
+                    f"SIP/2.0 200 OK\r\n"
+                    f"Via: {via}\r\n"
+                    f"From: {from_hdr}\r\n"
+                    f"To: {to_hdr}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq}\r\n"
+                    f"Content-Length: 0\r\n\r\n"
+                )
+                try:
+                    writer.write(ok_resp.encode())
+                    asyncio.create_task(writer.drain())
+                except Exception:
+                    pass
+
