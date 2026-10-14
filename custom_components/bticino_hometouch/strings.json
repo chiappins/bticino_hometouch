@@ -66,6 +66,12 @@
     "binary_sensor": {
       "doorbell": {
         "name": "Campanello"
+      },
+      "doorbell_gate": {
+        "name": "Campanello Cancelletto"
+      },
+      "doorbell_door": {
+        "name": "Campanello Portoncino"
       }
     }
   }

@@ -57,6 +57,12 @@
     "binary_sensor": {
       "doorbell": {
         "name": "Doorbell Call"
+      },
+      "doorbell_gate": {
+        "name": "Gate Doorbell"
+      },
+      "doorbell_door": {
+        "name": "Main Door Doorbell"
       }
     },
     "camera": {

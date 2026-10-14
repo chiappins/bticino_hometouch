@@ -165,14 +165,43 @@ class HometouchClient:
 
         self._listeners: list[Callable[[str, bool], None]] = []
         self._is_call_active = False
+        self._is_gate_call_active = False
+        self._is_door_call_active = False
+        self._last_call_address: str | None = None
+        self._last_call_source: str | None = None
+        self._last_call_frame: str | None = None
         self._running = False
         self._monitor_task: asyncio.Task | None = None
-        self._sip_listener_task: asyncio.Task | None = None
 
     @property
     def is_call_active(self) -> bool:
-        """Return True if doorbell call is active."""
+        """Return True if any doorbell call is active."""
         return self._is_call_active
+
+    @property
+    def is_gate_call_active(self) -> bool:
+        """Return True if gate doorbell call is active."""
+        return self._is_gate_call_active
+
+    @property
+    def is_door_call_active(self) -> bool:
+        """Return True if door doorbell call is active."""
+        return self._is_door_call_active
+
+    @property
+    def last_call_address(self) -> str | None:
+        """Return bus address of last incoming call."""
+        return self._last_call_address
+
+    @property
+    def last_call_source(self) -> str | None:
+        """Return source name of last incoming call (Portoncino o Cancelletto)."""
+        return self._last_call_source
+
+    @property
+    def last_call_frame(self) -> str | None:
+        """Return raw OpenWebNet frame of last call."""
+        return self._last_call_frame
 
     def register_listener(self, cb: Callable[[str, bool], None]) -> Callable[[], None]:
         """Register callback for event updates."""
@@ -335,14 +364,65 @@ class HometouchClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._sync_send_sip_command, body)
 
+    async def send_local_command(self, frame: str) -> bool:
+        """Send an OpenWebNet command directly over local LAN port 20000."""
+        try:
+            _LOGGER.info("Invio comando locale OpenWebNet a %s:%s: %s", self.host, self.port, frame)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port),
+                timeout=5.0
+            )
+            # Leggi ACK iniziale
+            await asyncio.wait_for(reader.read(100), timeout=3.0)
+
+            # Richiedi sessione comandi (*99*0##)
+            writer.write(OWN_CMD_SESSION.encode())
+            await writer.drain()
+
+            resp = await asyncio.wait_for(reader.read(100), timeout=3.0)
+            resp_str = resp.decode("latin1", errors="replace")
+
+            # Autenticazione HMAC-SHA256 se richiesta
+            auth_ok = await self._authenticate_session(reader, writer, resp_str)
+            if not auth_ok:
+                _LOGGER.error("Autenticazione sessione comandi locale fallita.")
+                writer.close()
+                await writer.wait_closed()
+                return False
+
+            # Invia il frame di comando
+            writer.write(frame.encode())
+            await writer.drain()
+
+            cmd_resp = await asyncio.wait_for(reader.read(100), timeout=3.0)
+            cmd_resp_str = cmd_resp.decode("latin1", errors="replace")
+            _LOGGER.info("Risposta citofono a comando locale '%s': %s", frame, cmd_resp_str)
+
+            writer.close()
+            await writer.wait_closed()
+            return cmd_resp_str == OWN_ACK or OWN_ACK in cmd_resp_str
+        except Exception as err:
+            _LOGGER.warning("Invio comando locale OpenWebNet (%s) non riuscito: %s", frame, err)
+            return False
+
+    async def send_command(self, frame: str) -> bool:
+        """Send command via local LAN OpenWebNet, fallback to SIP if offline."""
+        ok = await self.send_local_command(frame)
+        if ok:
+            return True
+        if self.sip_server and self.sip_user:
+            _LOGGER.info("Fallback a comando SIP remoto per frame: %s", frame)
+            return await self.send_sip_command(frame)
+        return False
+
     async def open_gate(self) -> bool:
         """Open the primary gate (Cancello Primario, WHERE=20)."""
         _LOGGER.info("Opening Primary Gate (addr: %s)", self.gate_addr)
         f_on = FRAME_DOOR_LOCK_ON.format(addr=self.gate_addr)
         f_off = FRAME_DOOR_LOCK_OFF.format(addr=self.gate_addr)
-        r1 = await self.send_sip_command(f_on)
+        r1 = await self.send_command(f_on)
         await asyncio.sleep(0.3)
-        r2 = await self.send_sip_command(f_off)
+        r2 = await self.send_command(f_off)
         return r1 and r2
 
     async def open_door(self) -> bool:
@@ -350,23 +430,23 @@ class HometouchClient:
         _LOGGER.info("Opening Secondary Portoncino (addr: %s)", self.door_addr)
         f_on = FRAME_DOOR_LOCK_ON.format(addr=self.door_addr)
         f_off = FRAME_DOOR_LOCK_OFF.format(addr=self.door_addr)
-        r1 = await self.send_sip_command(f_on)
+        r1 = await self.send_command(f_on)
         await asyncio.sleep(0.3)
-        r2 = await self.send_sip_command(f_off)
+        r2 = await self.send_command(f_off)
         return r1 and r2
 
     async def trigger_staircase_light(self) -> bool:
         """Trigger staircase / auxiliary light."""
         _LOGGER.info("Triggering staircase light")
         f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
-        return await self.send_sip_command(f)
+        return await self.send_command(f)
 
-    async def async_trigger_camera(self, duration: int = 15) -> bool:
+    async def async_trigger_camera(self, duration: int = 15, devaddr: str = "0") -> bool:
         """Trigger outdoor camera streaming via SIP INVITE session."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sync_trigger_camera, duration)
+        return await loop.run_in_executor(None, self._sync_trigger_camera, duration, devaddr)
 
-    def _sync_trigger_camera(self, duration: int = 15) -> bool:
+    def _sync_trigger_camera(self, duration: int = 15, devaddr: str = "0") -> bool:
         """Connect to SIP TLS, perform REGISTER and send INVITE with SRTP to wake up camera."""
         if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
             _LOGGER.error("Certificato o chiave SIP mancante per autoaccensione camera (%s, %s)", self.cert_file, self.key_file)
@@ -436,30 +516,33 @@ class HometouchClient:
                 ssl_sock.sendall(reg_auth.encode())
                 ssl_sock.recv(4096)
 
-            # 2. INVITE with SRTP SDP to wake up camera
+            # 2. INVITE with Autoaccensione SDP (DEVADDR a livello di sessione)
             cseq += 1
             branch = "z9hG4bK" + uuid.uuid4().hex[:12]
             tag = uuid.uuid4().hex[:8]
             crypto_key = "W190ZXN0X2tleV9mb3Jfc3J0cF9saW5waG9uZTF="
+            # Cruciale: i parametri DEVADDR e CAMERASLIDING devono risiedere nella session description
+            # (prima di m=audio) per essere letti dal core Linphone di HOMETOUCH come richiesta
+            # di autoaccensione/anteprima telecamera esterna, invece di una chiamata interfono al monitor.
             sdp_body = (
                 "v=0\r\n"
                 f"o={self.sip_user} 123456 654321 IN IP4 192.168.1.100\r\n"
                 "s=Talk\r\n"
                 "c=IN IP4 192.168.1.100\r\n"
                 "t=0 0\r\n"
+                f"a=DEVADDR:{devaddr}\r\n"
+                "a=CAMERASLIDING:1\r\n"
                 "m=audio 7078 RTP/SAVP 8 0 96\r\n"
                 "a=rtpmap:8 PCMA/8000\r\n"
                 "a=rtpmap:0 PCMU/8000\r\n"
                 "a=rtpmap:96 opus/48000/2\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
-                "a=sendrecv\r\n"
+                "a=recvonly\r\n"
                 "m=video 9078 RTP/SAVP 97\r\n"
                 "a=rtpmap:97 H264/90000\r\n"
                 "a=fmtp:97 profile-level-id=42801F\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
                 "a=recvonly\r\n"
-                "a=DEVADDR:0\r\n"
-                "a=CAMERASLIDING:1\r\n"
             )
             sdp_bytes = sdp_body.encode("utf-8")
             invite_msg = (
@@ -478,16 +561,26 @@ class HometouchClient:
             )
             ssl_sock.sendall(invite_msg.encode())
 
-            ssl_sock.settimeout(4.0)
+            ssl_sock.settimeout(2.0)
             last_branch = branch
             start_t = time.time()
             camera_woken = False
+            ringing_start = None
+            remote_to_header = f"<{target_uri}>"
 
-            while time.time() - start_t < (duration + 5):
+            while time.time() - start_t < (duration + 10):
                 try:
                     data = ssl_sock.recv(4096).decode(errors="replace")
                     if not data:
                         break
+                    _LOGGER.debug("SIP Camera response: %s", data[:200].replace("\r\n", " "))
+
+                    # Estrai l'header To dal messaggio per preservare l'eventuale tag del server
+                    for line in data.splitlines():
+                        if line.lower().startswith("to:") or line.lower().startswith("t:"):
+                            remote_to_header = line.split(":", 1)[1].strip()
+                            break
+
                     if "407 Proxy Authentication Required" in data or "401 Unauthorized" in data:
                         chal = _parse_digest_challenge(data)
                         auth_hdr = _compute_digest(
@@ -507,7 +600,7 @@ class HometouchClient:
                             f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
                             f"Max-Forwards: 70\r\n"
                             f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
-                            f"To: <{target_uri}>\r\n"
+                            f"To: {remote_to_header}\r\n"
                             f"Call-ID: {call_id}\r\n"
                             f"CSeq: {cseq} INVITE\r\n"
                             f"Proxy-Authorization: {auth_hdr}\r\n"
@@ -518,16 +611,72 @@ class HometouchClient:
                             f"{sdp_body}"
                         )
                         ssl_sock.sendall(invite_auth.encode())
-                    elif "180 Ringing" in data or "200 OK" in data:
-                        _LOGGER.info("Telecamera svegliata con successo via SIP INVITE! (180 Ringing)")
+
+                    elif "180 Ringing" in data:
+                        _LOGGER.info("Ricevuto 180 Ringing per autoaccensione camera (DEVADDR: %s)", devaddr)
+                        if ringing_start is None:
+                            ringing_start = time.time()
+                        # Se passano più di 4 secondi in 180 Ringing senza 200 OK, abortiamo con CANCEL per non far suonare il monitor
+                        if time.time() - ringing_start > 4.0:
+                            _LOGGER.warning("Nessun 200 OK ricevuto dopo 4s di Ringing, invio CANCEL per evitare squillo prolungato")
+                            cancel_msg = (
+                                f"CANCEL {target_uri} SIP/2.0\r\n"
+                                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
+                                f"Max-Forwards: 70\r\n"
+                                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                                f"To: {remote_to_header}\r\n"
+                                f"Call-ID: {call_id}\r\n"
+                                f"CSeq: {cseq} CANCEL\r\n"
+                                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                                f"Content-Length: 0\r\n\r\n"
+                            )
+                            ssl_sock.sendall(cancel_msg.encode())
+                            break
+
+                    elif "200 OK" in data:
+                        _LOGGER.info("Telecamera svegliata con successo via SIP INVITE! (200 OK ricevuto da HOMETOUCH)")
                         camera_woken = True
+                        # Invio immediato dell'ACK (obbligatorio da RFC 3261)
+                        ack_msg = (
+                            f"ACK {target_uri} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
+                            f"Max-Forwards: 70\r\n"
+                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                            f"To: {remote_to_header}\r\n"
+                            f"Call-ID: {call_id}\r\n"
+                            f"CSeq: {cseq} ACK\r\n"
+                            f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                            f"Content-Length: 0\r\n\r\n"
+                        )
+                        ssl_sock.sendall(ack_msg.encode())
+
+                        # Manteniamo la sessione aperta per la durata richiesta
                         time.sleep(duration)
+
+                        # Terminazione graziosa della sessione via BYE
+                        cseq += 1
+                        bye_msg = (
+                            f"BYE {target_uri} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
+                            f"Max-Forwards: 70\r\n"
+                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                            f"To: {remote_to_header}\r\n"
+                            f"Call-ID: {call_id}\r\n"
+                            f"CSeq: {cseq} BYE\r\n"
+                            f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                            f"Content-Length: 0\r\n\r\n"
+                        )
+                        ssl_sock.sendall(bye_msg.encode())
+                        break
+                except socket.timeout:
+                    if ringing_start and (time.time() - ringing_start > 4.0):
+                        _LOGGER.warning("Timeout in attesa del 200 OK dopo Ringing, invio CANCEL")
                         cancel_msg = (
                             f"CANCEL {target_uri} SIP/2.0\r\n"
                             f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
                             f"Max-Forwards: 70\r\n"
                             f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
-                            f"To: <{target_uri}>\r\n"
+                            f"To: {remote_to_header}\r\n"
                             f"Call-ID: {call_id}\r\n"
                             f"CSeq: {cseq} CANCEL\r\n"
                             f"User-Agent: DoorEntryTouch/1.9.2\r\n"
@@ -535,8 +684,7 @@ class HometouchClient:
                         )
                         ssl_sock.sendall(cancel_msg.encode())
                         break
-                except socket.timeout:
-                    break
+                    continue
 
             ssl_sock.close()
             return camera_woken
@@ -545,12 +693,11 @@ class HometouchClient:
             return False
 
     async def start_monitoring(self) -> None:
-        """Start background tasks to monitor doorbell events."""
+        """Start background task to monitor doorbell events via local OpenWebNet connection."""
         if self._running:
             return
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
-        self._sip_listener_task = asyncio.create_task(self._sip_listener_loop())
 
     async def stop_monitoring(self) -> None:
         """Stop background monitor tasks."""
@@ -559,12 +706,6 @@ class HometouchClient:
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
-            except asyncio.CancelledError:
-                pass
-        if self._sip_listener_task and not self._sip_listener_task.done():
-            self._sip_listener_task.cancel()
-            try:
-                await self._sip_listener_task
             except asyncio.CancelledError:
                 pass
 
@@ -661,254 +802,98 @@ class HometouchClient:
 
         is_call_start = False
         is_call_end = False
+        target_addr: str | None = None
 
-        if (
-            OWN_CALL_PATTERN in frame
-            or "*8*1#" in frame
-            or "*8*20#" in frame
-            or "*8*19#" in frame
-            or "*8*91##" in frame
-            or "*8*1*" in frame
-            or "*8*2*" in frame
-            or "*7*1#" in frame
-        ):
-            is_call_start = True
-        elif OWN_CALL_END_PATTERN in frame or "*8*92##" in frame or "*8*0#" in frame or "*8*0*" in frame:
-            is_call_end = True
-        elif frame.startswith("*8*") and frame.endswith("##"):
-            # Qualsiasi frame videocitofonico WHO=8
-            _LOGGER.info("Frame videocitofonia generico WHO=8 rilevato: %s", frame)
-            is_call_start = True
+        if frame.startswith("*8*") and frame.endswith("##"):
+            body = frame[3:-2]
+            if "*" in body:
+                parts = body.split("*")
+                what = parts[0]
+                where = parts[1] if len(parts) > 1 else None
+
+                # Chiamate da posto esterno (es. *8*9#1#2*21## o *8*9#1#4*20## o *8*40*20##)
+                if what.startswith("9#") or what == "40" or what in ("1", "1#", "2", "2#"):
+                    is_call_start = True
+                    target_addr = where
+                elif what == "41" or what in ("0", "0#") or what.startswith("0#"):
+                    is_call_end = True
+                    target_addr = where
+            elif body in ("91", "1"):
+                is_call_start = True
+            elif body in ("92", "0"):
+                is_call_end = True
+            elif OWN_CALL_PATTERN in frame:
+                is_call_start = True
+            elif OWN_CALL_END_PATTERN in frame:
+                is_call_end = True
 
         if is_call_start:
-            _LOGGER.info("🔔🔔🔔 CAMPANELLO ATTIVO! Rilevata chiamata citofonica (frame: %s) 🔔🔔🔔", frame)
+            source = "Citofono"
+            if target_addr == str(self.door_addr) or target_addr == "21":
+                source = "Portoncino"
+                self._is_door_call_active = True
+                self._notify_event("doorbell_door", True)
+            elif target_addr == str(self.gate_addr) or target_addr == "20":
+                source = "Cancelletto"
+                self._is_gate_call_active = True
+                self._notify_event("doorbell_gate", True)
+            else:
+                self._is_door_call_active = True
+                self._is_gate_call_active = True
+                self._notify_event("doorbell_door", True)
+                self._notify_event("doorbell_gate", True)
+
+            self._last_call_address = target_addr
+            self._last_call_source = source
+            self._last_call_frame = frame
             self._is_call_active = True
+
+            _LOGGER.info(
+                "🔔🔔🔔 CAMPANELLO ATTIVO [%s]! Rilevata chiamata citofonica (indirizzo: %s, frame: %s) 🔔🔔🔔",
+                source, target_addr, frame
+            )
             self._notify_event("doorbell", True)
-            asyncio.create_task(self._auto_reset_doorbell(25))
+            asyncio.create_task(self._auto_reset_doorbell(target_addr, 25))
+
         elif is_call_end:
             _LOGGER.info("🔕 Chiamata citofono terminata (frame: %s)", frame)
-            self._is_call_active = False
-            self._notify_event("doorbell", False)
+            if target_addr == str(self.door_addr) or target_addr == "21":
+                self._is_door_call_active = False
+                self._notify_event("doorbell_door", False)
+            elif target_addr == str(self.gate_addr) or target_addr == "20":
+                self._is_gate_call_active = False
+                self._notify_event("doorbell_gate", False)
+            else:
+                self._is_door_call_active = False
+                self._is_gate_call_active = False
+                self._notify_event("doorbell_door", False)
+                self._notify_event("doorbell_gate", False)
 
-    async def _auto_reset_doorbell(self, timeout: int = 25) -> None:
+            if not self._is_door_call_active and not self._is_gate_call_active:
+                self._is_call_active = False
+                self._notify_event("doorbell", False)
+
+    async def _auto_reset_doorbell(self, target_addr: str | None, timeout: int = 25) -> None:
         """Auto reset doorbell state after timeout if no end frame is received."""
         await asyncio.sleep(timeout)
-        if self._is_call_active:
-            _LOGGER.info("Auto-reset stato campanello dopo %ds di timeout", timeout)
+        if target_addr == str(self.door_addr) or target_addr == "21":
+            if self._is_door_call_active:
+                _LOGGER.info("Auto-reset stato campanello Portoncino dopo %ds", timeout)
+                self._is_door_call_active = False
+                self._notify_event("doorbell_door", False)
+        elif target_addr == str(self.gate_addr) or target_addr == "20":
+            if self._is_gate_call_active:
+                _LOGGER.info("Auto-reset stato campanello Cancelletto dopo %ds", timeout)
+                self._is_gate_call_active = False
+                self._notify_event("doorbell_gate", False)
+        else:
+            self._is_door_call_active = False
+            self._is_gate_call_active = False
+            self._notify_event("doorbell_door", False)
+            self._notify_event("doorbell_gate", False)
+
+        if not self._is_door_call_active and not self._is_gate_call_active:
             self._is_call_active = False
             self._notify_event("doorbell", False)
 
-    async def _sip_listener_loop(self) -> None:
-        """Maintain persistent SIP TLS connection to receive incoming calls (doorbell rings)."""
-        if not self.sip_server or not self.sip_user or not self.cert_file or not self.key_file:
-            _LOGGER.debug("SIP listener non avviato: credenziali o certificati SIP mancanti.")
-            return
-
-        _LOGGER.warning("🚀 Avvio monitor chiamate SIP BTicino su %s:%d (account: %s)", self.sip_server, self.sip_port, self.sip_user)
-
-        while self._running:
-            writer: asyncio.StreamWriter | None = None
-            try:
-                _LOGGER.info("Connessione SIP TLS a %s:%d...", self.sip_server, self.sip_port)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                ctx.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
-
-                reader, writer = await asyncio.open_connection(self.sip_server, self.sip_port, ssl=ctx)
-
-                call_id = f"ha-sip-{secrets.token_hex(8)}"
-                from_tag = f"tag-{secrets.token_hex(4)}"
-                cseq = 1
-
-                reg_msg = (
-                    f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
-                    f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
-                    f"Max-Forwards: 70\r\n"
-                    f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
-                    f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
-                    f"Call-ID: {call_id}\r\n"
-                    f"CSeq: {cseq} REGISTER\r\n"
-                    f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
-                    f"Expires: 300\r\n"
-                    f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
-                    f"Content-Length: 0\r\n\r\n"
-                )
-                writer.write(reg_msg.encode())
-                await writer.drain()
-
-                resp = (await reader.read(2048)).decode("latin1", errors="replace")
-                if "401 Unauthorized" in resp and self.sip_pass:
-                    chal = _parse_digest_challenge(resp)
-                    realm = chal.get("realm", self.sip_domain or "")
-                    nonce = chal.get("nonce", "")
-                    cseq += 1
-                    auth_digest = _compute_digest(
-                        "REGISTER",
-                        f"sip:{self.sip_domain}",
-                        realm,
-                        nonce,
-                        self.sip_user,
-                        self.sip_pass,
-                        qop=chal.get("qop"),
-                        opaque=chal.get("opaque"),
-                    )
-                    auth_reg = (
-                        f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
-                        f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
-                        f"Max-Forwards: 70\r\n"
-                        f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
-                        f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
-                        f"Call-ID: {call_id}\r\n"
-                        f"CSeq: {cseq} REGISTER\r\n"
-                        f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
-                        f"Authorization: {auth_digest}\r\n"
-                        f"Expires: 300\r\n"
-                        f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
-                        f"Content-Length: 0\r\n\r\n"
-                    )
-                    writer.write(auth_reg.encode())
-                    await writer.drain()
-                    resp = (await reader.read(2048)).decode("latin1", errors="replace")
-
-                if "200 " in resp or "200 OK" in resp or "successful" in resp.lower():
-                    _LOGGER.warning("🎉 Connessione SIP stabilita con successo! In ascolto delle chiamate dal campanello...")
-                else:
-                    _LOGGER.warning("Registrazione SIP non riuscita: %s", resp[:150])
-                    writer.close()
-                    await writer.wait_closed()
-                    await asyncio.sleep(20)
-                    continue
-
-                last_keepalive = time.time()
-                buffer = ""
-
-                while self._running:
-                    now = time.time()
-                    if now - last_keepalive > 120:
-                        cseq += 1
-                        re_reg = (
-                            f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
-                            f"Via: SIP/2.0/TLS 127.0.0.1:{self.sip_port};branch=z9hG4bK-{secrets.token_hex(4)}\r\n"
-                            f"Max-Forwards: 70\r\n"
-                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={from_tag}\r\n"
-                            f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
-                            f"Call-ID: {call_id}\r\n"
-                            f"CSeq: {cseq} REGISTER\r\n"
-                            f"Contact: <sip:{self.sip_user}@127.0.0.1:{self.sip_port};transport=tls>\r\n"
-                            f"Expires: 300\r\n"
-                            f"User-Agent: BTicino-HOMETOUCH-HA/1.0\r\n"
-                            f"Content-Length: 0\r\n\r\n"
-                        )
-                        writer.write(re_reg.encode())
-                        await writer.drain()
-                        last_keepalive = now
-
-                    try:
-                        chunk = await asyncio.wait_for(reader.read(2048), timeout=30.0)
-                        if not chunk:
-                            _LOGGER.warning("Connessione SIP chiusa dal server remoto.")
-                            break
-                        buffer += chunk.decode("latin1", errors="replace")
-                        self._process_sip_incoming(buffer, writer)
-                        buffer = ""
-                    except asyncio.TimeoutError:
-                        continue
-
-                if writer:
-                    writer.close()
-                    await writer.wait_closed()
-            except asyncio.CancelledError:
-                break
-            except Exception as err:
-                _LOGGER.warning("Errore connessione SIP listener (%s). Riconnessione tra 15s...", err)
-                if writer:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                await asyncio.sleep(15)
-
-    def _process_sip_incoming(self, data: str, writer: asyncio.StreamWriter) -> None:
-        """Process incoming SIP messages from server."""
-        _LOGGER.debug("Ricevuto messaggio SIP: %s", data[:200])
-
-        if "INVITE " in data:
-            _LOGGER.warning("🔔🔔🔔 CAMPANELLO ATTIVO! Rilevata chiamata citofonica in arrivo! 🔔🔔🔔")
-            self._is_call_active = True
-            self._notify_event("doorbell", True)
-
-            via = ""
-            from_hdr = ""
-            to_hdr = ""
-            call_id = ""
-            cseq = ""
-            for line in data.splitlines():
-                ll = line.lower()
-                if ll.startswith("via:"):
-                    via = line[4:].strip()
-                elif ll.startswith("from:"):
-                    from_hdr = line[5:].strip()
-                elif ll.startswith("to:"):
-                    to_hdr = line[3:].strip()
-                elif ll.startswith("call-id:"):
-                    call_id = line[8:].strip()
-                elif ll.startswith("cseq:"):
-                    cseq = line[5:].strip()
-
-            if via and from_hdr and to_hdr and call_id and cseq:
-                ringing_resp = (
-                    f"SIP/2.0 180 Ringing\r\n"
-                    f"Via: {via}\r\n"
-                    f"From: {from_hdr}\r\n"
-                    f"To: {to_hdr};tag=ha-{secrets.token_hex(4)}\r\n"
-                    f"Call-ID: {call_id}\r\n"
-                    f"CSeq: {cseq}\r\n"
-                    f"Content-Length: 0\r\n\r\n"
-                )
-                try:
-                    writer.write(ringing_resp.encode())
-                    asyncio.create_task(writer.drain())
-                except Exception as err:
-                    _LOGGER.warning("Errore invio 180 Ringing: %s", err)
-
-            asyncio.create_task(self._auto_reset_doorbell(30))
-
-        elif "CANCEL " in data or "BYE " in data:
-            _LOGGER.warning("🔕 Chiamata citofonica terminata.")
-            self._is_call_active = False
-            self._notify_event("doorbell", False)
-            via = ""
-            from_hdr = ""
-            to_hdr = ""
-            call_id = ""
-            cseq = ""
-            for line in data.splitlines():
-                ll = line.lower()
-                if ll.startswith("via:"):
-                    via = line[4:].strip()
-                elif ll.startswith("from:"):
-                    from_hdr = line[5:].strip()
-                elif ll.startswith("to:"):
-                    to_hdr = line[3:].strip()
-                elif ll.startswith("call-id:"):
-                    call_id = line[8:].strip()
-                elif ll.startswith("cseq:"):
-                    cseq = line[5:].strip()
-            if via and call_id and cseq:
-                ok_resp = (
-                    f"SIP/2.0 200 OK\r\n"
-                    f"Via: {via}\r\n"
-                    f"From: {from_hdr}\r\n"
-                    f"To: {to_hdr}\r\n"
-                    f"Call-ID: {call_id}\r\n"
-                    f"CSeq: {cseq}\r\n"
-                    f"Content-Length: 0\r\n\r\n"
-                )
-                try:
-                    writer.write(ok_resp.encode())
-                    asyncio.create_task(writer.drain())
-                except Exception:
-                    pass
 
