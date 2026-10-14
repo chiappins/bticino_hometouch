@@ -30,6 +30,7 @@ async def async_setup_entry(
             HometouchDoorButton(client, entry),
             HometouchStairLightButton(client, entry),
             HometouchCameraButton(client, entry),
+            HometouchSecondaryCameraButton(client, entry),
         ],
         True,
     )
@@ -108,10 +109,10 @@ class HometouchStairLightButton(HometouchBaseButton):
 
 
 class HometouchCameraButton(HometouchBaseButton):
-    """Button to wake up outdoor camera via SIP session."""
+    """Button to wake up primary outdoor camera via SIP session."""
 
     _attr_translation_key = "trigger_camera"
-    _attr_name = "Accendi Telecamera (SIP)"
+    _attr_name = "Accendi Telecamera Cancello (SIP)"
     _attr_icon = "mdi:camera-wireless"
 
     def __init__(self, client: HometouchClient, entry: ConfigEntry) -> None:
@@ -121,6 +122,24 @@ class HometouchCameraButton(HometouchBaseButton):
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        _LOGGER.info("Waking up outdoor camera via SIP session")
-        await self._client.async_trigger_camera()
+        _LOGGER.info("Waking up primary outdoor camera (PE 0) via SIP session")
+        await self._client.async_trigger_camera(devaddr="0")
+
+
+class HometouchSecondaryCameraButton(HometouchBaseButton):
+    """Button to wake up secondary outdoor camera via SIP session."""
+
+    _attr_translation_key = "trigger_camera_secondary"
+    _attr_name = "Accendi Telecamera Portoncino (SIP)"
+    _attr_icon = "mdi:camera-wireless-outline"
+
+    def __init__(self, client: HometouchClient, entry: ConfigEntry) -> None:
+        """Initialize the secondary camera trigger button."""
+        super().__init__(client, entry)
+        self._attr_unique_id = f"{entry.entry_id}_trigger_camera_secondary"
+
+    async def async_press(self) -> None:
+        """Handle the button press."""
+        _LOGGER.info("Waking up secondary outdoor camera (PE 1) via SIP session")
+        await self._client.async_trigger_camera(devaddr="1")
 
