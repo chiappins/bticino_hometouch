@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
@@ -24,23 +26,50 @@ async def async_setup_entry(
     """Set up the BTicino HOMETOUCH camera platform."""
     client: HometouchClient = hass.data[DOMAIN][entry.entry_id]["client"]
 
-    async_add_entities([HometouchCamera(client, entry)], True)
+    entities = [
+        HometouchCamera(
+            client=client,
+            entry=entry,
+            devaddr="20",
+            name="Telecamera Cancello",
+            unique_id_suffix="camera",
+            icon="mdi:cctv",
+        ),
+        HometouchCamera(
+            client=client,
+            entry=entry,
+            devaddr="21",
+            name="Telecamera Portoncino",
+            unique_id_suffix="camera_secondary",
+            icon="mdi:camera-wireless",
+        ),
+    ]
+
+    async_add_entities(entities, True)
 
 
 class HometouchCamera(Camera):
     """Camera entity for BTicino HOMETOUCH intercom video stream."""
 
     _attr_has_entity_name = True
-    _attr_translation_key = "intercom_camera"
-    _attr_name = "Videocitofono"
-    _attr_icon = "mdi:cctv"
 
-    def __init__(self, client: HometouchClient, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        client: HometouchClient,
+        entry: ConfigEntry,
+        devaddr: str,
+        name: str,
+        unique_id_suffix: str,
+        icon: str,
+    ) -> None:
         """Initialize the camera."""
         super().__init__()
         self._client = client
         self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_camera"
+        self._devaddr = devaddr
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{entry.entry_id}_{unique_id_suffix}"
         self._attr_supported_features = CameraEntityFeature.STREAM
 
         self._attr_device_info = DeviceInfo(
@@ -60,18 +89,56 @@ class HometouchCamera(Camera):
         if custom_url:
             return custom_url
 
-        # Default fallback stream: SIP/RTSP stream from Hometouch or go2rtc
-        return f"rtsp://{self._client.host}:554/live"
+        sdp_path = f"/tmp/bticino_camera_{self._devaddr}.sdp"
+        if os.path.exists(sdp_path):
+            return sdp_path
+        if os.path.exists("/tmp/bticino_camera.sdp"):
+            return "/tmp/bticino_camera.sdp"
+        return None
 
     async def async_create_stream(self):
         """Create stream and wake up camera via SIP session."""
-        self.hass.async_create_task(self._client.async_trigger_camera())
+        if not self._client.is_video_active or self._client.active_devaddr != self._devaddr:
+            self._client.video_ready_event.clear()
+            self.hass.async_create_task(
+                self._client.async_trigger_camera(duration=10, devaddr=self._devaddr)
+            )
+            try:
+                await asyncio.wait_for(self._client.video_ready_event.wait(), timeout=6.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timeout attesa attivazione video SIP per stream %s", self.name)
         return await super().async_create_stream()
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return a still image from the camera."""
-        # When integration is paired with go2rtc or stream component, Home Assistant handles frames
-        return None
+        if not self._client.is_video_active or self._client.active_devaddr != self._devaddr:
+            self._client.video_ready_event.clear()
+            self.hass.async_create_task(
+                self._client.async_trigger_camera(duration=10, devaddr=self._devaddr)
+            )
+            try:
+                await asyncio.wait_for(self._client.video_ready_event.wait(), timeout=6.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timeout attesa attivazione video SIP per snapshot %s", self.name)
+                return None
+
+        sdp_path = f"/tmp/bticino_camera_{self._devaddr}.sdp"
+        if not os.path.exists(sdp_path):
+            sdp_path = "/tmp/bticino_camera.sdp"
+
+        if not os.path.exists(sdp_path):
+            return None
+
+        try:
+            from homeassistant.components.ffmpeg import async_get_image
+            return await async_get_image(
+                self.hass,
+                sdp_path,
+                extra_cmd="-protocol_whitelist file,udp,rtp,crypto",
+            )
+        except Exception as exc:
+            _LOGGER.debug("Errore acquisizione frame FFmpeg per %s: %s", self.name, exc)
+            return None
 

@@ -13,7 +13,7 @@ import socket
 import ssl
 import time
 import uuid
-from typing import Callable
+from typing import Any, Callable
 
 from .const import (
     DEFAULT_DOOR_ADDR,
@@ -126,6 +126,46 @@ def _compute_digest(method: str, uri: str, realm: str, nonce: str, username: str
     return auth_hdr
 
 
+def _parse_remote_sdp(data: str) -> dict[str, Any] | None:
+    """Parse remote SDP parameters for video streaming."""
+    try:
+        sdp_idx = data.find("v=0")
+        if sdp_idx == -1:
+            return None
+        sdp = data[sdp_idx:]
+        remote_ip = None
+        remote_port = None
+        crypto_key = None
+        payload_type = "96"
+
+        for raw_line in sdp.splitlines():
+            line = raw_line.strip()
+            if line.startswith("c=IN IP4 "):
+                remote_ip = line.split("c=IN IP4 ")[1].strip()
+            elif line.startswith("m=video "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        remote_port = int(parts[1])
+                    except ValueError:
+                        pass
+                if len(parts) >= 4:
+                    payload_type = parts[3]
+            elif "a=crypto:1" in line and "inline:" in line:
+                crypto_key = line.split("inline:")[1].strip()
+
+        if remote_ip and remote_port and crypto_key:
+            return {
+                "remote_ip": remote_ip,
+                "remote_port": remote_port,
+                "crypto_key": crypto_key,
+                "payload_type": payload_type,
+            }
+    except Exception as exc:
+        _LOGGER.debug("Errore parsing SDP: %s", exc)
+    return None
+
+
 class HometouchClient:
     """Client for communicating with BTicino HOMETOUCH via LAN and SIP TLS."""
 
@@ -175,6 +215,11 @@ class HometouchClient:
         self._last_call_frame: str | None = None
         self._running = False
         self._monitor_task: asyncio.Task | None = None
+
+        self.is_video_active = False
+        self.video_ready_event = asyncio.Event()
+        self.last_sdp_path: str | None = None
+        self.active_devaddr: str | None = None
 
     @property
     def is_call_active(self) -> bool:
@@ -448,12 +493,17 @@ class HometouchClient:
         f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
         return await self.send_command(f)
 
-    async def async_trigger_camera(self, duration: int = 5, devaddr: str = "20") -> bool:
+    async def async_trigger_camera(self, duration: int = 10, devaddr: str = "20") -> bool:
         """Trigger outdoor camera streaming via SIP INVITE session."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sync_trigger_camera, duration, devaddr)
+        return await loop.run_in_executor(None, self._sync_trigger_camera, duration, devaddr, loop)
 
-    def _sync_trigger_camera(self, duration: int = 5, devaddr: str = "20") -> bool:
+    def _sync_trigger_camera(
+        self,
+        duration: int = 10,
+        devaddr: str = "20",
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> bool:
         """Connect to SIP TLS, perform REGISTER and send INVITE with SRTP to wake up camera."""
         if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
             _LOGGER.error("Certificato o chiave SIP mancante per autoaccensione camera (%s, %s)", self.cert_file, self.key_file)
@@ -679,6 +729,48 @@ class HometouchClient:
                         )
                         ssl_sock.sendall(ack_msg.encode())
 
+                        sdp_info = _parse_remote_sdp(data)
+                        if sdp_info:
+                            remote_ip = sdp_info["remote_ip"]
+                            remote_port = sdp_info["remote_port"]
+                            crypto_key = sdp_info["crypto_key"]
+                            payload_type = sdp_info["payload_type"]
+
+                            try:
+                                punch_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                punch_sock.bind(("", 9078))
+                                punch_sock.sendto(b"\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", (remote_ip, remote_port))
+                                punch_sock.close()
+                            except Exception as e:
+                                _LOGGER.debug("Pinhole NAT send: %s", e)
+
+                            sdp_content = (
+                                "v=0\r\n"
+                                "o=- 0 0 IN IP4 127.0.0.1\r\n"
+                                "s=BTicino HOMETOUCH Video\r\n"
+                                f"c=IN IP4 {remote_ip}\r\n"
+                                "t=0 0\r\n"
+                                f"m=video 9078 RTP/SAVP {payload_type}\r\n"
+                                f"a=rtpmap:{payload_type} H264/90000\r\n"
+                                f"a=fmtp:{payload_type} profile-level-id=42801F\r\n"
+                                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
+                            )
+                            sdp_path = f"/tmp/bticino_camera_{devaddr}.sdp"
+                            try:
+                                with open(sdp_path, "w") as f:
+                                    f.write(sdp_content)
+                                with open("/tmp/bticino_camera.sdp", "w") as f:
+                                    f.write(sdp_content)
+                                self.last_sdp_path = sdp_path
+                                _LOGGER.info("Creato file SDP video per Home Assistant: %s", sdp_path)
+                            except Exception as err:
+                                _LOGGER.error("Errore salvataggio file SDP: %s", err)
+
+                        self.is_video_active = True
+                        self.active_devaddr = devaddr
+                        if loop and loop.is_running():
+                            loop.call_soon_threadsafe(self.video_ready_event.set)
+
                         time.sleep(duration)
 
                         cseq += 1
@@ -725,6 +817,11 @@ class HometouchClient:
         except Exception as err:
             _LOGGER.error("Errore durante attivazione sessione SIP camera: %s", err)
             return False
+        finally:
+            self.is_video_active = False
+            self.active_devaddr = None
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(self.video_ready_event.clear)
 
     async def start_monitoring(self) -> None:
         """Start background task to monitor doorbell events via local OpenWebNet connection."""

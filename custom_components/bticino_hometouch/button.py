@@ -122,8 +122,8 @@ class HometouchCameraButton(HometouchBaseButton):
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        _LOGGER.info("Waking up primary outdoor camera (Cancello PE 0, DEVADDR 20) via SIP session")
-        await self._client.async_trigger_camera(devaddr="20")
+        _LOGGER.info("Waking up primary outdoor camera (Cancello PE 0, DEVADDR 20) via SIP session for 10s")
+        await self._client.async_trigger_camera(duration=10, devaddr="20")
 
 
 class HometouchSecondaryCameraButton(HometouchBaseButton):
@@ -140,6 +140,6 @@ class HometouchSecondaryCameraButton(HometouchBaseButton):
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        _LOGGER.info("Waking up secondary outdoor camera (Portoncino PE 1, DEVADDR 21) via SIP session")
-        await self._client.async_trigger_camera(devaddr="21")
+        _LOGGER.info("Waking up secondary outdoor camera (Portoncino PE 1, DEVADDR 21) via SIP session for 10s")
+        await self._client.async_trigger_camera(duration=10, devaddr="21")
 
