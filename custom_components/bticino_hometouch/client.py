@@ -448,12 +448,12 @@ class HometouchClient:
         f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
         return await self.send_command(f)
 
-    async def async_trigger_camera(self, duration: int = 15, devaddr: str = "0") -> bool:
+    async def async_trigger_camera(self, duration: int = 15, devaddr: str = "20") -> bool:
         """Trigger outdoor camera streaming via SIP INVITE session."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._sync_trigger_camera, duration, devaddr)
 
-    def _sync_trigger_camera(self, duration: int = 15, devaddr: str = "0") -> bool:
+    def _sync_trigger_camera(self, duration: int = 15, devaddr: str = "20") -> bool:
         """Connect to SIP TLS, perform REGISTER and send INVITE with SRTP to wake up camera."""
         if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
             _LOGGER.error("Certificato o chiave SIP mancante per autoaccensione camera (%s, %s)", self.cert_file, self.key_file)
@@ -473,20 +473,21 @@ class HometouchClient:
             s.settimeout(10)
             ssl_sock = ctx.wrap_socket(s, server_hostname=self.sip_server)
             ssl_sock.connect((self.sip_server, self.sip_port))
+            local_ip = ssl_sock.getsockname()[0]
 
             # 1. REGISTER
             branch = "z9hG4bK" + uuid.uuid4().hex[:12]
             tag = uuid.uuid4().hex[:8]
             reg_msg = (
                 f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
-                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Via: SIP/2.0/TLS {local_ip}:5061;branch={branch};rport\r\n"
                 f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                 f"Max-Forwards: 70\r\n"
                 f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
                 f"To: <sip:{self.sip_user}@{self.sip_domain}>\r\n"
                 f"Call-ID: {call_id}\r\n"
                 f"CSeq: {cseq} REGISTER\r\n"
-                f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                f"Contact: <sip:{self.sip_user}@{local_ip}:5061;transport=tls>\r\n"
                 f"Expires: 300\r\n"
                 f"User-Agent: DoorEntryTouch/1.9.2\r\n"
                 f"Content-Length: 0\r\n\r\n"
@@ -509,7 +510,7 @@ class HometouchClient:
                 branch = "z9hG4bK" + uuid.uuid4().hex[:12]
                 reg_auth = (
                     f"REGISTER sip:{self.sip_domain} SIP/2.0\r\n"
-                    f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                    f"Via: SIP/2.0/TLS {local_ip}:5061;branch={branch};rport\r\n"
                     f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                     f"Max-Forwards: 70\r\n"
                     f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
@@ -517,7 +518,7 @@ class HometouchClient:
                     f"Call-ID: {call_id}\r\n"
                     f"CSeq: {cseq} REGISTER\r\n"
                     f"Authorization: {auth_hdr}\r\n"
-                    f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                    f"Contact: <sip:{self.sip_user}@{local_ip}:5061;transport=tls>\r\n"
                     f"Expires: 300\r\n"
                     f"User-Agent: DoorEntryTouch/1.9.2\r\n"
                     f"Content-Length: 0\r\n\r\n"
@@ -525,17 +526,16 @@ class HometouchClient:
                 ssl_sock.sendall(reg_auth.encode())
                 ssl_sock.recv(4096)
 
-            # 2. INVITE with Autoaccensione SDP (DEVADDR a livello di sessione)
+            # 2. INVITE with Autoaccensione SDP (DEVADDR e TVCC a livello di sessione)
             cseq += 1
             branch = "z9hG4bK" + uuid.uuid4().hex[:12]
             tag = uuid.uuid4().hex[:8]
             crypto_key = "W190ZXN0X2tleV9mb3Jfc3J0cF9saW5waG9uZTF="
-            # Cruciale:
-            # - DEVADDR specifica quale posto esterno/telecamera accendere (es. 0, 20)
-            # - L'audio deve essere a=inactive (direzione inattiva) così il monitor HOMETOUCH
-            #   NON esegue una chiamata interfono audio verso l'interno, ma attiva solo lo streaming video
-            # - Il video è a=recvonly (il client riceve il flusso H264)
-            local_ip = ssl_sock.getsockname()[0]
+            # Cruciale per HOMETOUCH:
+            # - DEVADDR: indirizzo SCS del posto esterno (es. 20 Cancello, 21 Portoncino)
+            # - a=TVCC:1: flag essenziale CCTV che dice a HOMETOUCH di auto-rispondere e iniziare lo streaming video
+            # - a=inactive sull'audio: evita di far squillare il citofono interno come chiamata vocale
+            # - a=recvonly sul video: ricezione flusso H264
             sdp_body = (
                 "v=0\r\n"
                 f"o={self.sip_user} 123456 654321 IN IP4 {local_ip}\r\n"
@@ -543,13 +543,16 @@ class HometouchClient:
                 f"c=IN IP4 {local_ip}\r\n"
                 "t=0 0\r\n"
                 f"a=DEVADDR:{devaddr}\r\n"
+                "a=TVCC:1\r\n"
                 "m=audio 7078 RTP/SAVP 8 0 96\r\n"
                 "a=rtpmap:8 PCMA/8000\r\n"
                 "a=rtpmap:0 PCMU/8000\r\n"
                 "a=rtpmap:96 opus/48000/2\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
                 "a=inactive\r\n"
-                "m=video 9078 RTP/SAVP 97\r\n"
+                "m=video 9078 RTP/SAVP 96 97\r\n"
+                "a=rtpmap:96 H264/90000\r\n"
+                "a=fmtp:96 profile-level-id=42801F\r\n"
                 "a=rtpmap:97 H264/90000\r\n"
                 "a=fmtp:97 profile-level-id=42801F\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}\r\n"
