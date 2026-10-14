@@ -448,12 +448,12 @@ class HometouchClient:
         f = FRAME_STAIR_LIGHT.format(addr=self.gate_addr)
         return await self.send_command(f)
 
-    async def async_trigger_camera(self, duration: int = 15, devaddr: str = "20") -> bool:
+    async def async_trigger_camera(self, duration: int = 5, devaddr: str = "20") -> bool:
         """Trigger outdoor camera streaming via SIP INVITE session."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._sync_trigger_camera, duration, devaddr)
 
-    def _sync_trigger_camera(self, duration: int = 15, devaddr: str = "20") -> bool:
+    def _sync_trigger_camera(self, duration: int = 5, devaddr: str = "20") -> bool:
         """Connect to SIP TLS, perform REGISTER and send INVITE with SRTP to wake up camera."""
         if not self.cert_file or not self.key_file or not os.path.exists(self.cert_file) or not os.path.exists(self.key_file):
             _LOGGER.error("Certificato o chiave SIP mancante per autoaccensione camera (%s, %s)", self.cert_file, self.key_file)
