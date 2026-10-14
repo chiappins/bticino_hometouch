@@ -633,8 +633,8 @@ class HometouchClient:
                         _LOGGER.info("Ricevuto 180 Ringing per autoaccensione camera (DEVADDR: %s)", devaddr)
                         if ringing_start is None:
                             ringing_start = time.time()
-                        if time.time() - ringing_start > 4.0:
-                            _LOGGER.warning("Nessun 200 OK ricevuto dopo 4s di Ringing, invio CANCEL per evitare squillo prolungato")
+                        if time.time() - ringing_start > 15.0:
+                            _LOGGER.warning("Nessun 200 OK ricevuto dopo 15s di Ringing, invio CANCEL")
                             route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                             cancel_msg = (
                                 f"CANCEL {target_uri} SIP/2.0\r\n"
@@ -652,7 +652,7 @@ class HometouchClient:
                             break
 
                     elif "200 OK" in data:
-                        _LOGGER.info("Telecamera svegliata con successo via SIP INVITE! (200 OK ricevuto da HOMETOUCH)")
+                        _LOGGER.info("Telecamera svegliata con successo via SIP INVITE! Risposta HOMETOUCH:\n%s", data)
                         camera_woken = True
                         route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                         ack_msg = (
@@ -688,7 +688,7 @@ class HometouchClient:
                         ssl_sock.sendall(bye_msg.encode())
                         break
                 except socket.timeout:
-                    if ringing_start and (time.time() - ringing_start > 4.0):
+                    if ringing_start and (time.time() - ringing_start > 15.0):
                         _LOGGER.warning("Timeout in attesa del 200 OK dopo Ringing, invio CANCEL")
                         route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                         cancel_msg = (
