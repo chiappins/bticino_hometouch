@@ -535,11 +535,12 @@ class HometouchClient:
             # - L'audio deve essere a=inactive (direzione inattiva) così il monitor HOMETOUCH
             #   NON esegue una chiamata interfono audio verso l'interno, ma attiva solo lo streaming video
             # - Il video è a=recvonly (il client riceve il flusso H264)
+            local_ip = ssl_sock.getsockname()[0]
             sdp_body = (
                 "v=0\r\n"
-                f"o={self.sip_user} 123456 654321 IN IP4 192.168.1.100\r\n"
+                f"o={self.sip_user} 123456 654321 IN IP4 {local_ip}\r\n"
                 "s=Talk\r\n"
-                "c=IN IP4 192.168.1.100\r\n"
+                f"c=IN IP4 {local_ip}\r\n"
                 "t=0 0\r\n"
                 f"a=DEVADDR:{devaddr}\r\n"
                 "m=audio 7078 RTP/SAVP 8 0 96\r\n"
@@ -557,14 +558,14 @@ class HometouchClient:
             sdp_bytes = sdp_body.encode("utf-8")
             invite_msg = (
                 f"INVITE {target_uri} SIP/2.0\r\n"
-                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={branch};rport\r\n"
+                f"Via: SIP/2.0/TLS {local_ip}:5061;branch={branch};rport\r\n"
                 f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                 f"Max-Forwards: 70\r\n"
                 f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
                 f"To: <{target_uri}>\r\n"
                 f"Call-ID: {call_id}\r\n"
                 f"CSeq: {cseq} INVITE\r\n"
-                f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                f"Contact: <sip:{self.sip_user}@{local_ip}:5061;transport=tls>\r\n"
                 f"Content-Type: application/sdp\r\n"
                 f"User-Agent: DoorEntryTouch/1.9.2\r\n"
                 f"Content-Length: {len(sdp_bytes)}\r\n\r\n"
@@ -585,7 +586,11 @@ class HometouchClient:
                     data = ssl_sock.recv(4096).decode(errors="replace")
                     if not data:
                         break
-                    _LOGGER.debug("SIP Camera response: %s", data[:200].replace("\r\n", " "))
+                    _LOGGER.debug("SIP Camera response: %s", data[:300].replace("\r\n", " "))
+
+                    if "v=0" in data:
+                        sdp_idx = data.find("v=0")
+                        _LOGGER.info("Trovato SDP remoto da HOMETOUCH:\n%s", data[sdp_idx:])
 
                     for line in data.splitlines():
                         lower = line.lower()
@@ -609,11 +614,9 @@ class HometouchClient:
                         cseq += 1
                         last_branch = "z9hG4bK" + uuid.uuid4().hex[:12]
                         route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
-                        # Secondo RFC 3261 §8.1.3.5 l'INVITE con autenticazione è una nuova richiesta nel dialog,
-                        # quindi To NON deve contenere il tag del server inviato nel 407.
                         invite_auth = (
                             f"INVITE {target_uri} SIP/2.0\r\n"
-                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
+                            f"Via: SIP/2.0/TLS {local_ip}:5061;branch={last_branch};rport\r\n"
                             f"{route_hdr}"
                             f"Max-Forwards: 70\r\n"
                             f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
@@ -621,7 +624,7 @@ class HometouchClient:
                             f"Call-ID: {call_id}\r\n"
                             f"CSeq: {cseq} INVITE\r\n"
                             f"Proxy-Authorization: {auth_hdr}\r\n"
-                            f"Contact: <sip:{self.sip_user}@192.168.1.100:5061;transport=tls>\r\n"
+                            f"Contact: <sip:{self.sip_user}@{local_ip}:5061;transport=tls>\r\n"
                             f"Content-Type: application/sdp\r\n"
                             f"User-Agent: DoorEntryTouch/1.9.2\r\n"
                             f"Content-Length: {len(sdp_bytes)}\r\n\r\n"
@@ -630,15 +633,19 @@ class HometouchClient:
                         ssl_sock.sendall(invite_auth.encode())
 
                     elif "180 Ringing" in data:
-                        _LOGGER.info("Ricevuto 180 Ringing per autoaccensione camera (DEVADDR: %s)", devaddr)
+                        camera_woken = True
+                        _LOGGER.info("Ricevuto 180 Ringing per autoaccensione camera (DEVADDR: %s):\n%s", devaddr, data)
                         if ringing_start is None:
                             ringing_start = time.time()
-                        if time.time() - ringing_start > 15.0:
-                            _LOGGER.warning("Nessun 200 OK ricevuto dopo 15s di Ringing, invio CANCEL")
+
+                        # In SIP intercoms, video is transmitted during 180 Ringing (early media).
+                        # We keep the session active until duration has elapsed.
+                        if time.time() - start_t >= duration:
+                            _LOGGER.info("Durata autoaccensione camera raggiunta (%ds), invio CANCEL per chiudere", duration)
                             route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                             cancel_msg = (
                                 f"CANCEL {target_uri} SIP/2.0\r\n"
-                                f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
+                                f"Via: SIP/2.0/TLS {local_ip}:5061;branch={last_branch};rport\r\n"
                                 f"{route_hdr}"
                                 f"Max-Forwards: 70\r\n"
                                 f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
@@ -657,7 +664,7 @@ class HometouchClient:
                         route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                         ack_msg = (
                             f"ACK {target_uri} SIP/2.0\r\n"
-                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
+                            f"Via: SIP/2.0/TLS {local_ip}:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
                             f"{route_hdr}"
                             f"Max-Forwards: 70\r\n"
                             f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
@@ -675,7 +682,7 @@ class HometouchClient:
                         route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
                         bye_msg = (
                             f"BYE {target_uri} SIP/2.0\r\n"
-                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
+                            f"Via: SIP/2.0/TLS {local_ip}:5061;branch=z9hG4bK{uuid.uuid4().hex[:12]};rport\r\n"
                             f"{route_hdr}"
                             f"Max-Forwards: 70\r\n"
                             f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
@@ -688,23 +695,26 @@ class HometouchClient:
                         ssl_sock.sendall(bye_msg.encode())
                         break
                 except socket.timeout:
-                    if ringing_start and (time.time() - ringing_start > 15.0):
-                        _LOGGER.warning("Timeout in attesa del 200 OK dopo Ringing, invio CANCEL")
-                        route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
-                        cancel_msg = (
-                            f"CANCEL {target_uri} SIP/2.0\r\n"
-                            f"Via: SIP/2.0/TLS 192.168.1.100:5061;branch={last_branch};rport\r\n"
-                            f"{route_hdr}"
-                            f"Max-Forwards: 70\r\n"
-                            f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
-                            f"To: <{target_uri}>\r\n"
-                            f"Call-ID: {call_id}\r\n"
-                            f"CSeq: {cseq} CANCEL\r\n"
-                            f"User-Agent: DoorEntryTouch/1.9.2\r\n"
-                            f"Content-Length: 0\r\n\r\n"
-                        )
-                        ssl_sock.sendall(cancel_msg.encode())
-                        break
+                    if ringing_start:
+                        if time.time() - start_t >= duration:
+                            _LOGGER.info("Durata streaming camera terminata (%ds), chiusura sessione con CANCEL", duration)
+                            route_hdr = f"Route: {record_route}\r\n" if record_route else f"Route: <sip:{self.sip_server}:{self.sip_port};transport=tls;lr>\r\n"
+                            cancel_msg = (
+                                f"CANCEL {target_uri} SIP/2.0\r\n"
+                                f"Via: SIP/2.0/TLS {local_ip}:5061;branch={last_branch};rport\r\n"
+                                f"{route_hdr}"
+                                f"Max-Forwards: 70\r\n"
+                                f"From: <sip:{self.sip_user}@{self.sip_domain}>;tag={tag}\r\n"
+                                f"To: <{target_uri}>\r\n"
+                                f"Call-ID: {call_id}\r\n"
+                                f"CSeq: {cseq} CANCEL\r\n"
+                                f"User-Agent: DoorEntryTouch/1.9.2\r\n"
+                                f"Content-Length: 0\r\n\r\n"
+                            )
+                            ssl_sock.sendall(cancel_msg.encode())
+                            break
+                        continue
+                    continue
                     continue
 
             ssl_sock.close()
